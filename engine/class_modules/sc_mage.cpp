@@ -6,7 +6,8 @@
 // AULA-RETTELSE (simc-worker/patches/mage.patch i AULA-Guild):
 // Grov basismodel for Forever-mage, bygget efter warlock-modulets skabelon.
 // Kun spells der ikke afhaenger af talenter (rank efter spillerens level),
-// ingen talent-effekter, ingen Evocation. Alle tal kommer fra spildata.
+// ingen talent-effekter. Wand (Shoot) og Evocation til mana-styring.
+// Alle tal kommer fra spildata og vaabendata.
 // Fjernes naar upstream selv implementerer klassen.
 
 #include "simulationcraft.hpp"
@@ -16,10 +17,10 @@
 
 namespace mage
 {
-struct mage_t final : public player_t
+struct mage_t final : public parse_player_effects_t
 {
   mage_t( sim_t* sim, std::string_view name, race_e r = RACE_NONE ) :
-    player_t( sim, MAGE, name, r ) {}
+    parse_player_effects_t( sim, MAGE, name, r ) {}
 
   resource_e primary_resource() const override { return RESOURCE_MANA; }
 
@@ -31,10 +32,18 @@ struct mage_t final : public player_t
   void init_action_list() override;
   void init_base_stats() override;
   void init_spells() override;
+  void create_buffs() override;
+  void init_finished() override;
+
+  struct
+  {
+    buff_t* evocation;
+  } buff;
 
   struct
   {
     spell_ranks_t arcane_missiles;
+    spell_ranks_t evocation;
     spell_ranks_t fire_blast;
     spell_ranks_t fireball;
     spell_ranks_t frostbolt;
@@ -138,6 +147,74 @@ struct arcane_missiles_t : public mage_spell_t
   }
 };
 
+// Shoot (wand, 5019): et skud med den udstyrede wand i ranged-pladsen. Spildataen siger
+// Weapon Damage (NoSchool) og Spell Type Magic: skaden er wandens vaabenskade, skolen kommer
+// fra wanden (staar ikke i simcs item-data), og skuddet bruger spell-tabellen (hit/crit).
+// Hvert skud modelleres som en "cast" af wandens hastighed (auto-repeat afbrydes i spillet af
+// andre spells), saa APL'en kan vende tilbage til Frostbolt naar manaen er der igen.
+// Uden wand i ranged-pladsen er handlingen aldrig klar.
+struct shoot_t : public mage_spell_t
+{
+  shoot_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "shoot", player, player->find_spell( 5019 ) )
+  {
+    parse_options( options_str );
+
+    weapon            = &player->equipped_weapons[ SLOT_RANGED ];
+    weapon_multiplier = 1.0;
+    base_execute_time = weapon->swing_time;
+    may_crit          = true;
+    // Wandens egen skole, hvis profilen angiver den (weapon=wand_..._shadow); ellers spildataens.
+    if ( weapon->school != SCHOOL_PHYSICAL && weapon->school != SCHOOL_NONE )
+      school = weapon->school;
+  }
+
+  bool has_wand() const
+  { return weapon && weapon->type == WEAPON_WAND && weapon->max_dmg > 0; }
+
+  // Wand-skade er magisk (Spell Type Magic); rustning gaelder ikke, selv om skolen er ukendt.
+  double composite_target_armor( const action_state_t* ) const override
+  { return 0.0; }
+
+  // Wandens hastighed, ikke spell-haste.
+  timespan_t execute_time() const override
+  { return base_execute_time; }
+
+  bool ready() override
+  {
+    if ( !has_wand() )
+      return false;
+    return mage_spell_t::ready();
+  }
+};
+
+// Evocation (12051): kanaliseret paa magen selv i 8 s. Effekterne (Modify Power Regen% +1500 %
+// og Allow Mana Regen While Casting 100 %) ligger paa buffen og laeses af parse_player_effects.
+struct evocation_t : public mage_spell_t
+{
+  evocation_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "evocation", player, player->rank.evocation.find_rank()->spell() )
+  {
+    parse_options( options_str );
+
+    channeled = true;
+    harmful = may_miss = may_crit = false;
+    target = player;
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.evocation->trigger( composite_dot_duration( execute_state ) );
+  }
+
+  void last_tick( dot_t* d ) override
+  {
+    mage_spell_t::last_tick( d );
+    p()->buff.evocation->expire();
+  }
+};
+
 action_t* mage_t::create_action( std::string_view name, std::string_view options_str )
 {
   if ( name == "frostbolt" )
@@ -148,19 +225,45 @@ action_t* mage_t::create_action( std::string_view name, std::string_view options
     return new fire_blast_t( this, options_str );
   if ( name == "arcane_missiles" )
     return new arcane_missiles_t( this, options_str );
+  if ( name == "evocation" )
+    return new evocation_t( this, options_str );
+  if ( name == "shoot" )
+    return new shoot_t( this, options_str );
 
-  return player_t::create_action( name, options_str );
+  return parse_player_effects_t::create_action( name, options_str );
 }
 
 void mage_t::init_base_stats()
 {
   // Ingen egne konstanter: basis-crit m.m. kommer fra spildata via player_t.
-  player_t::init_base_stats();
+  parse_player_effects_t::init_base_stats();
+}
+
+void mage_t::create_buffs()
+{
+  parse_player_effects_t::create_buffs();
+
+  auto const evocation = rank.evocation.find_rank()->spell();
+  buff.evocation = make_buff_fallback( evocation->ok(), this, "evocation", evocation )
+                     ->set_cooldown( 0_ms )
+                     ->set_affects_regen( true );
+}
+
+void mage_t::init_finished()
+{
+  // Evocations regen-effekter (aura 110 og 134) virker gennem buffen.
+  parse_effects( buff.evocation );
+
+  parse_player_effects_t::init_finished();
 }
 
 void mage_t::init_spells()
 {
-  player_t::init_spells();
+  parse_player_effects_t::init_spells();
+
+  rank.evocation = { this,
+    spell_container_t().set_spell( 12051 ),  // 20
+  };
 
   // spell = kanaliseret driver, attack = Arcane Missile (udloest pr. tick); kommentar = spell level
   rank.arcane_missiles = { this,
@@ -221,14 +324,14 @@ void mage_t::init_action_list()
 {
   if ( !action_list_str.empty() )
   {
-    player_t::init_action_list();
+    parse_player_effects_t::init_action_list();
     return;
   }
 
   clear_action_priority_lists();
   mage_apl::mage( this );
   use_default_action_list = true;
-  player_t::init_action_list();
+  parse_player_effects_t::init_action_list();
 }
 
 }  // namespace mage
