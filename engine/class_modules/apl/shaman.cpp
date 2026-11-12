@@ -45,11 +45,14 @@ void shaman( player_t* p )
   precombat->add_action( "strength_of_earth_totem,if=!variable.caster" );
   precombat->add_action( "windfury_totem,if=!variable.caster" );
   precombat->add_action( "water_shield" );
+  // Mana Spring Totem (level 26) i vandpladsen for alle specs, som wowsims/forever's Elemental og Enhancement.
+  precombat->add_action( "mana_spring_totem" );
 
   default_->add_action( "run_action_list,name=caster,if=variable.caster" );
   default_->add_action( "auto_attack" );
   default_->add_action( "strength_of_earth_totem,if=!buff.strength_of_earth.up" );
   default_->add_action( "windfury_totem,if=!buff.windfury_totem.up" );
+  default_->add_action( "mana_spring_totem,if=!buff.mana_spring.up" );
   default_->add_action( "rage_of_the_farseer" );
   default_->add_action( "searing_totem,if=!ticking" );
   default_->add_action( "flame_shock,if=!ticking|remains<1" );
@@ -60,6 +63,10 @@ void shaman( player_t* p )
   // Caster: mana-fase som hos priest (ingen wand): under 10 % mana kastes der ikke, til manaen er over
   // 40 % igen, saa femsekundsreglen ikke blokerer spirit-regen. Taersklerne er antagelser.
   caster->add_action( "water_shield" );
+  // Mana Tide Totem (Restoration-talent): naar mindst halvdelen af manaen er brugt; tager Mana Spring ned,
+  // som saettes igen bagefter.
+  caster->add_action( "mana_tide_totem,if=mana.pct<50" );
+  caster->add_action( "mana_spring_totem,if=!buff.mana_spring.up&!buff.mana_tide.up" );
   caster->add_action( "variable,name=mana_phase,op=set,value=1,if=mana.pct<10" );
   caster->add_action( "variable,name=mana_phase,op=set,value=0,if=mana.pct>40" );
   caster->add_action( "searing_totem,if=!ticking" );

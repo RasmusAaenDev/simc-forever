@@ -4,7 +4,8 @@
 // ==========================================================================
 // AULA-RETTELSE (simc-worker/patches/shaman.patch i AULA-Guild): Lightning Bolt, Chain Lightning,
 // Elemental Focus, Lightning Overload, Lightning Mastery, Water Shield, Stormstrike, Flurry, Maelstrom
-// Weapon, Windfury Totem, Rage of the Farseer og en caster-/naerkamp-rotation efter talenter. Se PATCHES.md.
+// Weapon, Windfury Totem, Rage of the Farseer, Mana Spring/Mana Tide Totem og en caster-/naerkamp-rotation
+// efter talenter. Se PATCHES.md.
 
 #include "simulationcraft.hpp"
 #include "action/parse_effects.hpp"
@@ -58,11 +59,15 @@ struct shaman_t final : public player_t
     buff_t* maelstrom_weapon = nullptr;   // 408505
     buff_t* rage_of_the_farseer = nullptr;// 425336
     buff_t* windfury_totem = nullptr;     // totemets aura (8515 ...)
+    buff_t* mana_spring = nullptr;        // Mana Spring Totem (5675 ...) som selv-aura (5677 ...)
+    buff_t* mana_tide = nullptr;          // Mana Tide Totem (16190 ...) som selv-aura (16191 ...)
   } buff;
 
   struct
   {
     gain_t* water_shield = nullptr;
+    gain_t* mana_spring = nullptr;
+    gain_t* mana_tide = nullptr;
   } gains;
 
   struct talents_t
@@ -84,6 +89,8 @@ struct shaman_t final : public player_t
     player_talent_t lightning_overload;
     player_talent_t lightning_mastery;
     player_talent_t water_shield;
+    player_talent_t restorative_totems;
+    player_talent_t mana_tide_totem;
   } talent;
 
   action_t* flametongue_attack = nullptr;
@@ -101,6 +108,8 @@ struct shaman_t final : public player_t
     spell_ranks_t chain_lightning;
     spell_ranks_t windfury_totem;
     spell_ranks_t searing_totem;
+    spell_ranks_t mana_spring_totem;
+    spell_ranks_t mana_tide_totem;
   } rank;
 };
 
@@ -287,6 +296,8 @@ void shaman_t::init_spells()
   talent.lightning_overload  = find_talent_spell( talent_tree::CLASS, "Lightning Overload" );
   talent.lightning_mastery   = find_talent_spell( talent_tree::CLASS, "Lightning Mastery" );
   talent.water_shield        = find_talent_spell( talent_tree::CLASS, "Water Shield" );
+  talent.restorative_totems  = find_talent_spell( talent_tree::CLASS, "Restorative Totems" );
+  talent.mana_tide_totem     = find_talent_spell( talent_tree::CLASS, "Mana Tide Totem" );
 
   rank.lightning_bolt = spell_ranks_t( this,
     spell_container_t().set_spell( 403 ),    // 1
@@ -320,6 +331,20 @@ void shaman_t::init_spells()
     spell_container_t().set_spell( 8512 ).set_aura( 8515 ).set_attack( 8516 ),     // 32
     spell_container_t().set_spell( 10613 ).set_aura( 10609 ).set_attack( 10608 ),  // 42
     spell_container_t().set_spell( 10614 ).set_aura( 10612 ).set_attack( 10610 )   // 52
+  );
+  // Mana Spring Totem: kast og totemets aura (Periodic Energize hvert 2. s).
+  rank.mana_spring_totem = spell_ranks_t( this,
+    spell_container_t().set_spell( 5675 ).set_aura( 5677 ),     // 26
+    spell_container_t().set_spell( 10495 ).set_aura( 10491 ),   // 36
+    spell_container_t().set_spell( 10496 ).set_aura( 10493 ),   // 46
+    spell_container_t().set_spell( 10497 ).set_aura( 10494 )    // 56
+  );
+  // Mana Tide Totem (talent): kast og totemets aura (Periodic Energize hvert 3. s).
+  rank.mana_tide_totem = spell_ranks_t( this, talent.mana_tide_totem,
+    spell_container_t().set_spell( 16190 ).set_aura( 16191 ),       // talent
+    spell_container_t().set_spell( 17354 ).set_aura( 17355 ),       // 38
+    spell_container_t().set_spell( 17359 ).set_aura( 17360 ),       // 48
+    spell_container_t().set_spell( 1325256 ).set_aura( 1325257 )    // 58
   );
 }
 
@@ -702,6 +727,31 @@ struct windfury_totem_t : public shaman_spell_t
   }
 };
 
+// Mana Spring Totem (5675 ...) og Mana Tide Totem (talent 16190 ...): vandtotems, modelleret som en
+// selv-aura (som Strength of Earth og Windfury ovenfor), der giver aura-spellens mana (effekt 1) hvert
+// 2./3. sekund i totemets levetid. Kun eet vandtotem ad gangen: Mana Tide tager Mana Spring ned (som
+// wowsims/forever). Restorative Totems (talent 16187, effekt 1) oeger Mana Springs mana med 5-25 %.
+struct water_totem_t : public shaman_spell_t
+{
+  bool tide;
+
+  water_totem_t( std::string_view n, shaman_t* player, const spell_data_t* s, bool tide,
+                 util::string_view options_str ) :
+    shaman_spell_t( n, player, s ), tide( tide )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = player;
+  }
+
+  void execute() override
+  {
+    shaman_spell_t::execute();
+    ( tide ? p()->buff.mana_spring : p()->buff.mana_tide )->expire();
+    ( tide ? p()->buff.mana_tide : p()->buff.mana_spring )->trigger();
+  }
+};
+
 // ==========================================================================
 // Shaman Attack
 // ==========================================================================
@@ -842,6 +892,12 @@ action_t* shaman_t::create_action( util::string_view name, util::string_view opt
     return new windfury_totem_t( this, options_str );
   if ( name == "searing_totem" )
     return new searing_totem_t( this, options_str );
+  if ( name == "mana_spring_totem" )
+    return new water_totem_t( "mana_spring_totem", this, rank.mana_spring_totem.find_rank()->spell(), false,
+                              options_str );
+  if ( name == "mana_tide_totem" )
+    return new water_totem_t( "mana_tide_totem", this, rank.mana_tide_totem.find_rank()->spell(), true,
+                              options_str );
 
   return player_t::create_action( name, options_str );
 }
@@ -882,12 +938,37 @@ void shaman_t::create_buffs()
   buff.windfury_totem = make_buff_fallback( wft->spell()->ok(), this, "windfury_totem", wft->spell() )
     ->set_duration( wft->spell()->duration() )
     ->set_cooldown( 0_ms );
+
+  // Vandtotems: aura-spellens Periodic Energize (effekt 1: mana pr. tick, tick-periode) i totemets levetid.
+  // Mana Tides beskrivelse siger ${$d-1} sek., dvs. 12 s og 4 ticks.
+  auto make_water_totem = [ this ]( std::string_view n, const spell_container_t* r, double mult, timespan_t trim,
+                                    gain_t*& gain ) {
+    const spell_data_t* aura = r->aura();
+    bool ok = r->spell()->ok() && aura->ok();
+    buff_t* b = make_buff_fallback( ok, this, n, r->spell() );
+    if ( ok )
+    {
+      double mana = aura->effectN( 1 ).base_value() * mult;
+      b->set_duration( r->spell()->duration() - trim )
+        ->set_cooldown( 0_ms )
+        ->set_period( aura->effectN( 1 ).period() )
+        ->set_tick_zero( false )
+        ->set_tick_callback( [ this, mana, &gain ]( buff_t*, int, timespan_t ) {
+            resource_gain( RESOURCE_MANA, mana, gain ); } );
+    }
+    return b;
+  };
+  buff.mana_spring = make_water_totem( "mana_spring", rank.mana_spring_totem.find_rank(),
+                                       1.0 + talent.restorative_totems->effectN( 1 ).percent(), 0_ms, gains.mana_spring );
+  buff.mana_tide = make_water_totem( "mana_tide", rank.mana_tide_totem.find_rank(), 1.0, 1_s, gains.mana_tide );
 }
 
 void shaman_t::init_gains()
 {
   player_t::init_gains();
   gains.water_shield = get_gain( "water_shield" );
+  gains.mana_spring = get_gain( "mana_spring" );
+  gains.mana_tide = get_gain( "mana_tide" );
   water_shield_icd = get_cooldown( "water_shield_icd" );
   water_shield_icd->duration = talent.water_shield.ok() ? talent.water_shield->internal_cooldown() : 0_ms;
   windfury_icd = get_cooldown( "windfury_totem_icd" );
