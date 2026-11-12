@@ -1854,6 +1854,7 @@ enum spell_attribute : unsigned
   SX_NO_THREAT                      = 42u,
   SX_DISCOUNT_ON_MISS               = 59u,
   SX_DONT_DISPLAY_IN_AURA_BAR       = 60u,
+  SX_ALLOW_WHILE_NOT_SHAPESHIFTED   = 83u,
   SX_CANNOT_CRIT                    = 93u,
   SX_FOOD_AURA                      = 95u,
   SX_NOT_A_PROC                     = 105u,

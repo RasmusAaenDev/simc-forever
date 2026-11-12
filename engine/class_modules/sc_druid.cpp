@@ -320,6 +320,11 @@ struct druid_action_t : public parse_action_effects_t<Base>
   {
     form_mask = this->data().stance_mask();
 
+    // Spells such as Wrath and Moonfire list only Moonkin Form in their stance mask, but are flagged as castable
+    // without a shapeshift (attribute 83), i.e. in caster form.
+    if ( form_mask && this->data().flags( spell_attribute::SX_ALLOW_WHILE_NOT_SHAPESHIFTED ) )
+      form_mask |= CASTER_FORM;
+
     if ( this->data().ok() )
     {
       p->apply_action_effects( this );
