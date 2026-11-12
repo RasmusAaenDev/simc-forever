@@ -37,9 +37,20 @@ void warlock( player_t* p )
 
   precombat->add_action( "summon_imp" );
 
-  default_->add_action( "immolate,if=!ticking|remains<2" );
+  // AULA-RETTELSE: Life Tap ved lav mana (livet er uendeligt i simc; antagelse: en healer daekker det),
+  // Bane of Agony og Siphon Life som DoTs, og spec-talenterne efter hvad warlocken har laert:
+  // Destruction (Shadowburn, Conflagrate, Incinerate) og Affliction (Wrack). Wand naar intet andet kan kastes.
+  default_->add_action( "life_tap,if=mana.pct<20" );
+  default_->add_action( "shadowburn" );
+  default_->add_action( "conflagrate,if=dot.immolate.ticking" );
+  default_->add_action( "bane_of_agony,if=!ticking" );
   default_->add_action( "corruption,if=!ticking|remains<2" );
+  default_->add_action( "siphon_life,if=!ticking" );
+  default_->add_action( "immolate,if=!ticking|remains<2" );
+  default_->add_action( "wrack,if=dot.corruption.ticking&dot.bane_of_agony.ticking" );
+  default_->add_action( "incinerate,if=dot.immolate.ticking" );
   default_->add_action( "shadow_bolt" );
+  default_->add_action( "shoot" );
 }
 //warlock_apl_end
 }  // namespace warlock_apl

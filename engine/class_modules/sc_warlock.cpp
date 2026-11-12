@@ -1,3 +1,6 @@
+// AULA-RETTELSE (simc-worker/patches/warlock.patch i AULA-Guild): Life Tap, wand (Shoot), Bane of Agony,
+// Siphon Life, Shadowburn, Conflagrate, Incinerate, Wrack, Improved Shadow Bolt og en rotation der vaelger
+// efter talenter. Se PATCHES.md.
 #include "simulationcraft.hpp"
 #include "action/parse_effects.hpp"
 
@@ -20,6 +23,8 @@ struct warlock_t final : public player_t
   void init_action_list() override;
   void init_base_stats() override;
   void init_spells() override;
+  void create_buffs() override;
+  void init_gains() override;
 
   void create_pets() override;
 
@@ -34,7 +39,41 @@ struct warlock_t final : public player_t
     spell_ranks_t firebolt;
     spell_ranks_t immolate;
     spell_ranks_t shadow_bolt;
+    spell_ranks_t life_tap;
+    spell_ranks_t bane_of_agony;
+    spell_ranks_t siphon_life;
+    spell_ranks_t shadowburn;
+    spell_ranks_t conflagrate;
+    spell_ranks_t incinerate;
+    spell_ranks_t wrack;
   } rank;
+
+  struct
+  {
+    player_talent_t improved_life_tap;
+    player_talent_t siphon_life;
+    player_talent_t shadowburn;
+    player_talent_t conflagrate;
+    player_talent_t incinerate;
+    player_talent_t wrack;
+    player_talent_t improved_shadow_bolt;
+  } talent;
+
+  struct
+  {
+    // Improved Shadow Bolt: Shadow Vulnerability (17794). Ligger paa warlocken (kun dens egen skade
+    // paavirkes, og Patchwerk har eet maal); med flere maal gaelder den dermed for alle.
+    buff_t* shadow_vulnerability = nullptr;
+  } buff;
+
+  struct
+  {
+    gain_t* life_tap = nullptr;
+  } gains;
+
+  // Til Conflagrate (forbruger Immolate) og Wrack (forstaerker de andre Shadow-DoTs).
+  action_t* immolate_action = nullptr;
+  action_t* wrack_action    = nullptr;
 };
 
 struct warlock_module_t : public module_t
@@ -73,6 +112,31 @@ public:
 
   const warlock_t* p() const
   { return debug_cast<const warlock_t*>( this->player ); }
+
+  // Maalets debuffs fra warlocken: Shadow Vulnerability (Improved Shadow Bolt) paa al Shadow-skade, og
+  // Wrack (+10 % paa warlockens andre Shadow-DoTs, mens den kanaliseres). Maal-multiplikatoren
+  // genberegnes ved hvert tick, saa begge virker ogsaa paa DoTs, der allerede tikker.
+  double composite_target_multiplier( player_t* t ) const override
+  {
+    double m = ab::composite_target_multiplier( t );
+    if ( this->get_school() == SCHOOL_SHADOW && p()->buff.shadow_vulnerability &&
+         p()->buff.shadow_vulnerability->check() )
+      m *= 1.0 + p()->buff.shadow_vulnerability->check_value();
+    return m;
+  }
+
+  double composite_target_ta_multiplier( player_t* t ) const override
+  {
+    double m = ab::composite_target_ta_multiplier( t );
+    const action_t* wrack = p()->wrack_action;
+    if ( wrack && wrack != this && this->get_school() == SCHOOL_SHADOW )
+    {
+      const dot_t* d = wrack->find_dot( t );
+      if ( d && d->is_ticking() )
+        m *= 1.0 + wrack->data().effectN( 2 ).percent();
+    }
+    return m;
+  }
 };
 
 using warlock_spell_t  = warlock_action_t<spell_t>;
@@ -85,6 +149,14 @@ struct shadow_bolt_t : public warlock_spell_t
   {
     parse_options( options_str );
   }
+
+  // Improved Shadow Bolt: et crit giver Shadow Vulnerability (+4-20 % Shadow-skade efter rank, 12 s).
+  void impact( action_state_t* s ) override
+  {
+    warlock_spell_t::impact( s );
+    if ( p()->talent.improved_shadow_bolt.ok() && s->result == RESULT_CRIT )
+      p()->buff.shadow_vulnerability->trigger( 1, p()->talent.improved_shadow_bolt->effectN( 1 ).percent() );
+  }
 };
 
 // Immolate
@@ -94,6 +166,8 @@ struct immolate_t : public warlock_spell_t
     warlock_spell_t( "immolate", player, player->rank.immolate.find_rank()->spell() )
   {
     parse_options( options_str );
+    if ( !player->immolate_action )
+      player->immolate_action = this;
   }
 };
 
@@ -104,6 +178,186 @@ struct corruption_t : public warlock_spell_t
     warlock_spell_t( "corruption", player, player->rank.corruption.find_rank()->spell() )
   {
     parse_options( options_str );
+  }
+};
+
+// Shoot (wand, 5019): samme model som mage- og priest-rettelsen. Wandens vaabenskade fra
+// ranged-pladsen, spell-tabellen (hit/crit), ingen rustning, wandens hastighed, ingen mana.
+// Uden wand i ranged-pladsen er handlingen aldrig klar.
+struct shoot_t : public warlock_spell_t
+{
+  shoot_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "shoot", player, player->find_spell( 5019 ) )
+  {
+    parse_options( options_str );
+
+    weapon            = &player->equipped_weapons[ SLOT_RANGED ];
+    weapon_multiplier = 1.0;
+    base_execute_time = weapon->swing_time;
+    may_crit          = true;
+    // Wandens egen skole, hvis profilen angiver den (weapon=wand_..._shadow); ellers spildataens.
+    if ( weapon->school != SCHOOL_PHYSICAL && weapon->school != SCHOOL_NONE )
+      school = weapon->school;
+  }
+
+  bool has_wand() const
+  { return weapon && weapon->type == WEAPON_WAND && weapon->max_dmg > 0; }
+
+  double composite_target_armor( const action_state_t* ) const override
+  { return 0.0; }
+
+  timespan_t execute_time() const override
+  { return base_execute_time; }
+
+  bool ready() override
+  {
+    if ( !has_wand() )
+      return false;
+    return warlock_spell_t::ready();
+  }
+};
+
+// Life Tap (1454 ...): (effekt 1 + Spirit) liv bliver til lige saa meget mana, Improved Life Tap
+// (18182) oeger kun manaen (som wowsims/forever lifetap.go). Spillerens liv er uendeligt i simc
+// (ingen indgaaende skade i en DPS-simulering), saa livet traekkes ikke; antagelse: en healer
+// eller pauser daekker det. Ingen mana-pris, saa femsekundsreglen nulstilles ikke.
+struct life_tap_t : public warlock_spell_t
+{
+  life_tap_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "life_tap", player, player->rank.life_tap.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = callbacks = false;
+    target = player;
+    base_dd_min = base_dd_max = 0;
+    spell_power_mod.direct = 0;
+  }
+
+  double mana_gain() const
+  {
+    double amount = data().effectN( 1 ).average( p() ) + p()->cache.spirit();
+    if ( p()->talent.improved_life_tap.ok() )
+      amount *= 1.0 + p()->talent.improved_life_tap->effectN( 1 ).percent();
+    return amount;
+  }
+
+  void execute() override
+  {
+    warlock_spell_t::execute();
+    p()->resource_gain( RESOURCE_MANA, mana_gain(), p()->gains.life_tap, this );
+  }
+};
+
+// Bane of Agony (980 ...): Forever-navnet for Curse of Agony (instant, 24 s). Skaden bygger op: et
+// tick i foerste tredjedel giver det halve af grundvaerdien, i anden hele, i sidste halvanden gang
+// (wowsims/forever agony.go). Spell power-andelen stiger ikke. Summen er den samme som et jaevnt tick.
+struct bane_of_agony_t : public warlock_spell_t
+{
+  bane_of_agony_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "bane_of_agony", player, player->rank.bane_of_agony.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+
+  double base_ta( const action_state_t* s ) const override
+  {
+    double b = warlock_spell_t::base_ta( s );
+    const dot_t* d = find_dot( s->target );
+    if ( !d || !d->is_ticking() )
+      return b;
+    int n = d->num_ticks();
+    int k = d->current_tick;
+    if ( n <= 0 || k <= 0 )
+      return b;
+    if ( 3 * k <= n )
+      return b * 0.5;
+    if ( 3 * k <= 2 * n )
+      return b;
+    return b * 1.5;
+  }
+};
+
+// Siphon Life (talent, 18265 ...): Periodic Health Leech; kun skaden simuleres (livet er uendeligt).
+struct siphon_life_t : public warlock_spell_t
+{
+  siphon_life_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "siphon_life", player, player->rank.siphon_life.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+};
+
+// Shadowburn (talent, 17877 ...): instant Shadow-skade, 15 s nedkoeling (effekt 2; effekt 1 er
+// soul shard-auraen ved maalets doed og simuleres ikke).
+struct shadowburn_t : public warlock_spell_t
+{
+  shadowburn_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "shadowburn", player, player->rank.shadowburn.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    dot_duration = 0_ms;
+  }
+};
+
+// Conflagrate (talent, 1293817 ...): kraever warlockens Immolate paa maalet og fjerner den.
+struct conflagrate_t : public warlock_spell_t
+{
+  conflagrate_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "conflagrate", player, player->rank.conflagrate.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+
+  dot_t* immolate_dot( player_t* t ) const
+  { return p()->immolate_action ? p()->immolate_action->find_dot( t ) : nullptr; }
+
+  bool target_ready( player_t* t ) override
+  {
+    const dot_t* d = immolate_dot( t );
+    if ( !d || !d->is_ticking() )
+      return false;
+    return warlock_spell_t::target_ready( t );
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    warlock_spell_t::impact( s );
+    if ( result_is_hit( s->result ) )
+      if ( dot_t* d = immolate_dot( s->target ) )
+        d->cancel();
+  }
+};
+
+// Incinerate (talent, 412758 ...): Fire-skade, +25 % (effekt 2) hvis maalet har warlockens Immolate.
+struct incinerate_t : public warlock_spell_t
+{
+  incinerate_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "incinerate", player, player->rank.incinerate.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+
+  double composite_target_da_multiplier( player_t* t ) const override
+  {
+    double m = warlock_spell_t::composite_target_da_multiplier( t );
+    const dot_t* d = p()->immolate_action ? p()->immolate_action->find_dot( t ) : nullptr;
+    if ( d && d->is_ticking() )
+      m *= 1.0 + data().effectN( 2 ).percent();
+    return m;
+  }
+};
+
+// Wrack (talent, 1316697): kanaliseret 6 s, Shadow-skade hvert sekund; mens den tikker, tager maalet
+// +10 % fra warlockens andre Shadow-DoTs (se composite_target_ta_multiplier ovenfor).
+struct wrack_t : public warlock_spell_t
+{
+  wrack_t( warlock_t* player, util::string_view options_str ) :
+    warlock_spell_t( "wrack", player, player->rank.wrack.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    channeled = true;
+    if ( !player->wrack_action )
+      player->wrack_action = this;
   }
 };
 
@@ -261,6 +515,23 @@ action_t* warlock_t::create_action( util::string_view name, util::string_view op
   if ( name == "summon_imp" )
     return new summon_imp_t( this, options_str );
 
+  if ( name == "shoot" )
+    return new shoot_t( this, options_str );
+  if ( name == "life_tap" )
+    return new life_tap_t( this, options_str );
+  if ( name == "bane_of_agony" )
+    return new bane_of_agony_t( this, options_str );
+  if ( name == "siphon_life" )
+    return new siphon_life_t( this, options_str );
+  if ( name == "shadowburn" )
+    return new shadowburn_t( this, options_str );
+  if ( name == "conflagrate" )
+    return new conflagrate_t( this, options_str );
+  if ( name == "incinerate" )
+    return new incinerate_t( this, options_str );
+  if ( name == "wrack" )
+    return new wrack_t( this, options_str );
+
   return player_t::create_action( name, options_str );
 }
 
@@ -327,8 +598,84 @@ void warlock_t::init_spells()
     spell_container_t().set_spell( 25307 ),
   };
 
+  talent.improved_life_tap    = find_talent_spell( talent_tree::CLASS, "Improved Life Tap" );
+  talent.siphon_life          = find_talent_spell( talent_tree::CLASS, "Siphon Life" );
+  talent.shadowburn           = find_talent_spell( talent_tree::CLASS, "Shadowburn" );
+  talent.conflagrate          = find_talent_spell( talent_tree::CLASS, "Conflagrate" );
+  talent.incinerate           = find_talent_spell( talent_tree::CLASS, "Incinerate" );
+  talent.wrack                = find_talent_spell( talent_tree::CLASS, "Wrack" );
+  talent.improved_shadow_bolt = find_talent_spell( talent_tree::CLASS, "Improved Shadow Bolt" );
+
+  rank.life_tap = { this,
+    spell_container_t().set_spell(  1454 ),  // 6
+    spell_container_t().set_spell(  1455 ),  // 16
+    spell_container_t().set_spell(  1456 ),  // 26
+    spell_container_t().set_spell( 11687 ),  // 36
+    spell_container_t().set_spell( 11688 ),  // 46
+    spell_container_t().set_spell( 11689 ),  // 56
+  };
+
+  rank.bane_of_agony = { this,
+    spell_container_t().set_spell(   980 ),  // 8
+    spell_container_t().set_spell(  1014 ),  // 18
+    spell_container_t().set_spell(  6217 ),  // 28
+    spell_container_t().set_spell( 11711 ),  // 38
+    spell_container_t().set_spell( 11712 ),  // 48
+    spell_container_t().set_spell( 11713 ),  // 58
+  };
+
+  rank.siphon_life = { this, talent.siphon_life,
+    spell_container_t().set_spell( 18265 ),  // 30
+    spell_container_t().set_spell( 18879 ),  // 38
+    spell_container_t().set_spell( 18880 ),  // 48
+    spell_container_t().set_spell( 18881 ),  // 58
+  };
+
+  rank.shadowburn = { this, talent.shadowburn,
+    spell_container_t().set_spell( 17877 ),  // 20
+    spell_container_t().set_spell( 18867 ),  // 24
+    spell_container_t().set_spell( 18868 ),  // 32
+    spell_container_t().set_spell( 18869 ),  // 40
+    spell_container_t().set_spell( 18870 ),  // 48
+    spell_container_t().set_spell( 18871 ),  // 56
+  };
+
+  rank.conflagrate = { this, talent.conflagrate,
+    spell_container_t().set_spell( 1293817 ),  // 25
+    spell_container_t().set_spell( 1293818 ),  // 32
+    spell_container_t().set_spell(   17962 ),  // 40
+    spell_container_t().set_spell(   18930 ),  // 48
+    spell_container_t().set_spell(   18931 ),  // 54
+    spell_container_t().set_spell(   18932 ),  // 60
+  };
+
+  rank.incinerate = { this, talent.incinerate,
+    spell_container_t().set_spell(  412758 ),  // 40
+    spell_container_t().set_spell( 1293812 ),  // 50
+    spell_container_t().set_spell( 1293813 ),  // 60
+  };
+
+  rank.wrack = { this, talent.wrack,
+    spell_container_t().set_spell( 1316697 ),  // 40
+  };
+
   parse_all_class_passives();
   parse_all_passive_talents();
+}
+
+void warlock_t::create_buffs()
+{
+  player_t::create_buffs();
+
+  buff.shadow_vulnerability = make_buff_fallback( talent.improved_shadow_bolt.ok(), this, "shadow_vulnerability",
+                                                  find_spell( 17794 ) );
+}
+
+void warlock_t::init_gains()
+{
+  player_t::init_gains();
+
+  gains.life_tap = get_gain( "life_tap" );
 }
 
 void warlock_t::init_action_list()
