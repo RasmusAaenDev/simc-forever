@@ -134,6 +134,9 @@ struct hunter_t final : public parse_player_effects_t
     spell_ranks_t claw;
   } rank;
 
+  // Orc racial: pet damage.
+  const spell_data_t* command = spell_data_t::nil();
+
   struct
   {
     action_t* raptor_strike = nullptr;
@@ -205,6 +208,7 @@ const pet_family_t* find_pet_family( std::string_view name )
 // power per point (4.2 x creature dps, which matches pet sheets at level 11, 17 and 30), so the 2.0 s swing before
 // attack power is 70% of the creature damage, spanning 20% either side. On top of that the pet takes 10% of the
 // hunter's higher attack power (melee or ranged), the hunter's crit and hit, and is always Happy (+25% damage).
+// An orc hunter's pet deals 5% more (Command).
 // Numbers from wowsims/forever sim/hunter/pets.go (MIT).
 struct hunter_pet_t final : public pet_t
 {
@@ -323,6 +327,8 @@ struct hunter_pet_t final : public pet_t
       m *= 1.0 + o()->talent.focused_fire->effectN( 1 ).percent();
     if ( buffs.bestial_wrath->check() )
       m *= 1.0 + buffs.bestial_wrath->check_value();
+    if ( o()->command->ok() )
+      m *= 1.0 + o()->command->effectN( 1 ).percent();
 
     return m;
   }
@@ -1125,6 +1131,7 @@ void hunter_t::init_spells()
   };
 
   aimed_multi_shot = get_cooldown( "aimed_multi_shot" );
+  command = find_racial_spell( "Command" );
 
   // The pet: summon_pet=<family> (or none), and by default a cat unless the hunter has Lone Wolf (+20% damage with
   // no pet out). With a pet out anyway, Lone Wolf's damage is dropped. Hunters tame their first pet at level 10.
