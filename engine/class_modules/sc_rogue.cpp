@@ -9,6 +9,8 @@
 // og combo points; builders (Sinister Strike, Mutilate, Shank), finishers
 // (Eviscerate, Slice and Dice, Rupture), aabning fra Stealth (Ambush/Garrote),
 // Instant/Deadly Poison som vaabenprocs. Rank vaelges efter spillerens level.
+// Combat/Subtlety: Backstab, Hemorrhage, Ghostly Strike (Ambush i kampen), Premeditation,
+// Preparation, Initiative, Boot Knife, Puncturing Wounds, Ruthlessness og Hack and Slash.
 // Talenternes passive effekter laeses fra spildata (parse_all_passive_talents);
 // enkelte proc-/buff-talenter er haandskrevet (se PATCHES.md).
 // Alle tal kommer fra spildata og vaabendata, undtagen de klassiske basis-AP-
@@ -53,6 +55,9 @@ struct rogue_t final : public parse_player_effects_t
   void trigger_poisons( const action_state_t* s, const weapon_t* w );
   void trigger_seal_fate( const action_state_t* s );
   void trigger_relentless_strikes( int cp, action_t* a );
+  void trigger_ruthlessness( action_t* a );
+  void trigger_hack_and_slash( const action_state_t* s, const weapon_t* w );
+  void add_combo_points( double n, gain_t* g, proc_t* pr, action_t* a );
 
   struct
   {
@@ -61,6 +66,8 @@ struct rogue_t final : public parse_player_effects_t
     buff_t* cold_blood      = nullptr;
     buff_t* slice_and_dice  = nullptr;
     buff_t* venom           = nullptr;
+    buff_t* ghostly_strike  = nullptr;  // 1329326: naeste Ambush/Garrote kraever ikke Stealth
+    buff_t* hemorrhage      = nullptr;  // 16511 effekt 3: +15 % Rupture/Garrote (paa rogue'en; eet maal)
   } buff;
 
   struct
@@ -75,12 +82,21 @@ struct rogue_t final : public parse_player_effects_t
     player_talent_t relentless_strikes;
     player_talent_t seal_fate;
     player_talent_t venom;
+    player_talent_t boot_knife;
+    player_talent_t ghostly_strike;
+    player_talent_t hemorrhage;
+    player_talent_t initiative;
+    player_talent_t premeditation;
+    player_talent_t preparation;
+    player_talent_t puncturing_wounds;
+    player_talent_t ruthlessness;
   } talent;
 
   struct
   {
     gain_t* relentless_strikes = nullptr;
     gain_t* seal_fate          = nullptr;
+    gain_t* combo_talents      = nullptr;  // Puncturing Wounds, Ruthlessness, Initiative, Boot Knife
   } gain;
 
   struct
@@ -88,14 +104,24 @@ struct rogue_t final : public parse_player_effects_t
     proc_t* seal_fate = nullptr;
     proc_t* instant_poison = nullptr;
     proc_t* deadly_poison  = nullptr;
+    proc_t* improved_backstab = nullptr;
+    proc_t* ruthlessness      = nullptr;
+    proc_t* initiative        = nullptr;
+    proc_t* boot_knife        = nullptr;
+    proc_t* hack_and_slash    = nullptr;
   } proc;
 
   cooldown_t* seal_fate_icd = nullptr;
+  cooldown_t* ruthlessness_icd = nullptr;
+  cooldown_t* hack_and_slash_icd = nullptr;
+  action_t* hack_and_slash_mh = nullptr;
+  action_t* hack_and_slash_oh = nullptr;
 
   // Gifte: spell = vaabenbelaegningen (proc-chance), attack = skaden (Instant) / DoT'en (Deadly)
   struct
   {
     spell_ranks_t ambush;
+    spell_ranks_t backstab;
     spell_ranks_t deadly_poison;
     spell_ranks_t eviscerate;
     spell_ranks_t garrote;
@@ -160,7 +186,8 @@ public:
   {
     if ( finisher && p()->resources.current[ RESOURCE_COMBO_POINT ] < 1 )
       return false;
-    if ( requires_stealth && this->player->in_combat )
+    // Ghostly Strike (talent): naeste Ambush/Garrote kraever ikke Stealth (1329326)
+    if ( requires_stealth && this->player->in_combat && !p()->buff.ghostly_strike->check() )
       return false;
     return ab::ready();
   }
@@ -196,7 +223,11 @@ public:
     {
       p()->resource_loss( RESOURCE_COMBO_POINT, cp, nullptr, this );
       p()->trigger_relentless_strikes( cp, this );
+      p()->trigger_ruthlessness( this );
     }
+
+    if ( requires_stealth && this->player->in_combat && p()->buff.ghostly_strike->check() )
+      p()->buff.ghostly_strike->expire();
 
     // Cold Blood bruges af naeste beroerte handling (Mutilates to slag deler den; Mutilate selv fjerner den)
     if ( cold_blood && !this->background && p()->buff.cold_blood->check() )
@@ -208,7 +239,20 @@ public:
     ab::impact( s );
 
     if ( weapon_strike && this->result_is_hit( s->result ) )
+    {
       p()->trigger_poisons( s, this->weapon );
+      p()->trigger_hack_and_slash( s, this->weapon );
+    }
+  }
+
+  // Hack and Slash, kolle-delen (13709/13960 effekt 2): angreb med en kolle ignorerer 3-15 % af rustningen.
+  double composite_target_armor( const action_state_t* s ) const override
+  {
+    double a = ab::composite_target_armor( s );
+    if ( this->weapon && p()->talent.hack_and_slash.ok() &&
+         ( this->weapon->type == WEAPON_MACE || this->weapon->type == WEAPON_MACE_2H ) )
+      a *= 1.0 - p()->talent.hack_and_slash->effectN( 2 ).percent();
+    return a;
   }
 
   double composite_crit_chance() const override
@@ -345,6 +389,44 @@ void rogue_t::trigger_relentless_strikes( int cp, action_t* a )
     resource_gain( RESOURCE_ENERGY, find_spell( 14181 )->effectN( 1 ).base_value(), gain.relentless_strikes, a );
 }
 
+void rogue_t::add_combo_points( double n, gain_t* g, proc_t* pr, action_t* a )
+{
+  if ( pr )
+    pr->occur();
+  resource_gain( RESOURCE_COMBO_POINT, n, g, a );
+}
+
+// Ruthlessness (14156): finishers har 20/40/60 % chance for 1 combo point (14157); 0,5 s ICD fra spildata.
+void rogue_t::trigger_ruthlessness( action_t* a )
+{
+  if ( !talent.ruthlessness.ok() || ruthlessness_icd->down() )
+    return;
+  if ( rng().roll( talent.ruthlessness->effectN( 1 ).percent() ) )
+  {
+    ruthlessness_icd->start( talent.ruthlessness->internal_cooldown() );
+    add_combo_points( find_spell( 14157 )->effectN( 1 ).base_value(), gain.combo_talents, proc.ruthlessness, a );
+  }
+}
+
+// Hack and Slash, oekse/svaerd-delen (13960 effekt 3): et ramt vaabenslag har 1-5 % chance for et ekstra
+// slag med samme vaaben; 0,2 s ICD fra spildata. Antagelse: det ekstra slag er et almindeligt hvidt slag.
+void rogue_t::trigger_hack_and_slash( const action_state_t* s, const weapon_t* w )
+{
+  if ( !w || !talent.hack_and_slash.ok() || hack_and_slash_icd->down() )
+    return;
+  if ( w->type != WEAPON_SWORD && w->type != WEAPON_SWORD_2H && w->type != WEAPON_AXE && w->type != WEAPON_AXE_2H )
+    return;
+  action_t* extra = w->slot == SLOT_OFF_HAND ? hack_and_slash_oh : hack_and_slash_mh;
+  if ( !extra || s->action == extra )
+    return;
+  if ( rng().roll( talent.hack_and_slash->effectN( 3 ).percent() ) )
+  {
+    hack_and_slash_icd->start( talent.hack_and_slash->internal_cooldown() );
+    proc.hack_and_slash->occur();
+    extra->execute_on_target( s->target );
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////////////////
 //
 // Auto-attack (hovedhaand + off-hand)
@@ -363,6 +445,23 @@ struct rogue_melee_t : public rogue_attack_t
     trigger_gcd       = 0_ms;
 
     background = repeating = true;
+    may_glance = may_crit = may_dodge = may_parry = true;
+    special       = false;
+    weapon_strike = true;
+  }
+};
+
+// Hack and Slash' ekstra slag: som et hvidt slag med vaabnet, men udloest (ikke gentaget).
+struct hack_and_slash_attack_t : public rogue_attack_t
+{
+  hack_and_slash_attack_t( std::string_view name, rogue_t* p, weapon_t* w ) :
+    rogue_attack_t( name, p, spell_data_t::nil() )
+  {
+    weapon            = w;
+    weapon_multiplier = 1.0;
+    school            = SCHOOL_PHYSICAL;
+    trigger_gcd       = 0_ms;
+    background = true;
     may_glance = may_crit = may_dodge = may_parry = true;
     special       = false;
     weapon_strike = true;
@@ -420,6 +519,80 @@ struct sinister_strike_t : public rogue_attack_t
   {
     rogue_attack_t::impact( s );
     p()->trigger_seal_fate( s );
+  }
+};
+
+// Backstab (53 ...): 150 % vaabenskade + fast bonus, 1 combo point, kraever dolk i hovedhaanden og at rogue'en
+// staar bag maalet (antagelse: i en gruppe med en tank; simc har ingen position). Puncturing Wounds: crit via
+// spildata, og effekt 2 giver 15/30/45 % chance for et ekstra combo point (Improved Backstab, 1310710).
+struct backstab_t : public rogue_attack_t
+{
+  backstab_t( rogue_t* p, std::string_view options_str ) :
+    rogue_attack_t( "backstab", p, if_dagger( p, p->rank.backstab.find_rank()->spell() ) )
+  {
+    parse_options( options_str );
+    cold_blood = weapon_strike = true;
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    rogue_attack_t::impact( s );
+    p()->trigger_seal_fate( s );
+    if ( result_is_hit( s->result ) && p()->talent.puncturing_wounds.ok() &&
+         rng().roll( p()->talent.puncturing_wounds->effectN( 2 ).percent() ) )
+      p()->add_combo_points( 1, p()->gain.combo_talents, p()->proc.improved_backstab, this );
+  }
+};
+
+// Hemorrhage (talent 16511): 100 % vaabenskade (effekt 4), 145 % med dolk (effekt 5), normaliseret
+// (effekt 1), 1 combo point, og maalet tager +15 % Rupture- og Garrote-skade fra rogue'en i 15 s (effekt 3).
+struct hemorrhage_t : public rogue_attack_t
+{
+  hemorrhage_t( rogue_t* p, std::string_view options_str ) :
+    rogue_attack_t( "hemorrhage", p, p->talent.hemorrhage.ok() ? p->talent.hemorrhage.spell() : spell_data_t::not_found() )
+  {
+    parse_options( options_str );
+    weapon_strike = true;
+    if ( data().ok() )
+    {
+      weapon_multiplier = ( p->weapon_is( SLOT_MAIN_HAND, WEAPON_DAGGER ) ? data().effectN( 5 ) : data().effectN( 4 ) ).percent();
+      normalize_weapon_speed = true;
+    }
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    rogue_attack_t::impact( s );
+    p()->trigger_seal_fate( s );
+    if ( result_is_hit( s->result ) )
+      p()->buff.hemorrhage->trigger();
+  }
+};
+
+// Ghostly Strike (talent 14278): 125 % vaabenskade (effekt 1), 180 % med dolk (effekt 4), normaliseret
+// (effekt 5), 1 combo point, 20 s nedkoeling; naeste Ambush eller Garrote inden for 7 s kraever ikke Stealth
+// (effekt 6 -> 1329326). Dodge-delen paavirker ikke skaden.
+struct ghostly_strike_t : public rogue_attack_t
+{
+  ghostly_strike_t( rogue_t* p, std::string_view options_str ) :
+    rogue_attack_t( "ghostly_strike", p, p->talent.ghostly_strike.ok() ? p->talent.ghostly_strike.spell() : spell_data_t::not_found() )
+  {
+    parse_options( options_str );
+    weapon_strike = true;
+    if ( data().ok() )
+    {
+      weapon_multiplier = p->weapon_is( SLOT_MAIN_HAND, WEAPON_DAGGER ) ? data().effectN( 4 ).percent()
+                                                                        : data().effectN( 1 ).percent();
+      normalize_weapon_speed = true;
+    }
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    rogue_attack_t::impact( s );
+    p()->trigger_seal_fate( s );
+    if ( result_is_hit( s->result ) )
+      p()->buff.ghostly_strike->trigger();
   }
 };
 
@@ -517,6 +690,16 @@ struct shank_t : public rogue_attack_t
     if ( p()->talent.venom.ok() )
       p()->buff.venom->trigger();
   }
+
+  // Boot Knife (talent 1329286): 20-100 % chance for 2 combo points (1329285) ved et ramt Shank.
+  void impact( action_state_t* s ) override
+  {
+    rogue_attack_t::impact( s );
+    if ( result_is_hit( s->result ) && p()->talent.boot_knife.ok() &&
+         rng().roll( p()->talent.boot_knife->effectN( 1 ).percent() ) )
+      p()->add_combo_points( p()->talent.boot_knife->effectN( 2 ).base_value(), p()->gain.combo_talents,
+                             p()->proc.boot_knife, this );
+  }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////
@@ -524,6 +707,20 @@ struct shank_t : public rogue_attack_t
 // Aabning fra Stealth (kun foer kampen)
 //
 /////////////////////////////////////////////////////////////////////////////////////
+
+// Initiative (talent 13976): Ambush og Garrote har 33/67/100 % chance for et ekstra combo point (13977).
+static void trigger_initiative( rogue_t* p, const action_state_t* s, action_t* a )
+{
+  if ( a->result_is_hit( s->result ) && p->talent.initiative.ok() &&
+       p->rng().roll( p->talent.initiative->effectN( 1 ).percent() ) )
+    p->add_combo_points( 1, p->gain.combo_talents, p->proc.initiative, a );
+}
+
+// Hemorrhage-debuffen (+15 % Rupture- og Garrote-skade fra rogue'en)
+static double hemorrhage_bleed_multiplier( const rogue_t* p )
+{
+  return p->buff.hemorrhage->check() ? 1.0 + p->talent.hemorrhage->effectN( 3 ).percent() : 1.0;
+}
 
 struct ambush_t : public rogue_attack_t
 {
@@ -538,6 +735,7 @@ struct ambush_t : public rogue_attack_t
   {
     rogue_attack_t::impact( s );
     p()->trigger_seal_fate( s );
+    trigger_initiative( p(), s, this );
   }
 };
 
@@ -549,6 +747,15 @@ struct garrote_t : public rogue_attack_t
     parse_options( options_str );
     requires_stealth = true;
   }
+
+  void impact( action_state_t* s ) override
+  {
+    rogue_attack_t::impact( s );
+    trigger_initiative( p(), s, this );
+  }
+
+  double composite_ta_multiplier( const action_state_t* s ) const override
+  { return rogue_attack_t::composite_ta_multiplier( s ) * hemorrhage_bleed_multiplier( p() ); }
 
   // Bleed: rustning gaelder ikke
   double composite_target_armor( const action_state_t* ) const override
@@ -622,6 +829,9 @@ struct rupture_t : public rogue_attack_t
   double base_ta( const action_state_t* s ) const override
   { return rogue_attack_t::base_ta( s ) + cp * data().effectN( 1 ).pp_combo_points(); }
 
+  double composite_ta_multiplier( const action_state_t* s ) const override
+  { return rogue_attack_t::composite_ta_multiplier( s ) * hemorrhage_bleed_multiplier( p() ); }
+
   // Bleed: rustning gaelder ikke
   double composite_target_armor( const action_state_t* ) const override
   { return 0.0; }
@@ -652,6 +862,46 @@ struct buff_spell_t : public rogue_spell_t
   }
 };
 
+// Premeditation (talent 14183): +2 combo points, 120 s nedkoeling. I Forever kun «Allow While Stealthed»,
+// ikke «Only Stealthed», saa den bruges i kampen. «Mistes efter 20 s» er ikke med (rotationen bruger dem).
+struct premeditation_t : public rogue_spell_t
+{
+  premeditation_t( rogue_t* p, std::string_view options_str ) :
+    rogue_spell_t( "premeditation", p, p->talent.premeditation.ok() ? p->talent.premeditation.spell() : spell_data_t::not_found() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = p;
+  }
+
+  void execute() override
+  {
+    rogue_spell_t::execute();
+    p()->add_combo_points( data().effectN( 1 ).base_value(), p()->gain.combo_talents, nullptr, this );
+  }
+};
+
+// Preparation (talent 14185, 600 s): «finishes the cooldown on your other Rogue abilities». Nulstiller de
+// nedkoelinger, modellen har (Premeditation, Ghostly Strike, Cold Blood, Adrenaline Rush, Blade Flurry, Shank).
+struct preparation_t : public rogue_spell_t
+{
+  preparation_t( rogue_t* p, std::string_view options_str ) :
+    rogue_spell_t( "preparation", p, p->talent.preparation.ok() ? p->talent.preparation.spell() : spell_data_t::not_found() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = p;
+  }
+
+  void execute() override
+  {
+    rogue_spell_t::execute();
+    for ( const char* n : { "premeditation", "ghostly_strike", "cold_blood", "adrenaline_rush", "blade_flurry", "shank" } )
+      if ( cooldown_t* cd = p()->find_cooldown( n ) )
+        cd->reset( false );
+  }
+};
+
 /////////////////////////////////////////////////////////////////////////////////////
 //
 // Spiller
@@ -662,6 +912,11 @@ action_t* rogue_t::create_action( std::string_view name, std::string_view option
 {
   if ( name == "auto_attack" )     return new auto_attack_t( this, options_str );
   if ( name == "sinister_strike" ) return new sinister_strike_t( this, options_str );
+  if ( name == "backstab" )        return new backstab_t( this, options_str );
+  if ( name == "hemorrhage" )      return new hemorrhage_t( this, options_str );
+  if ( name == "ghostly_strike" )  return new ghostly_strike_t( this, options_str );
+  if ( name == "premeditation" )   return new premeditation_t( this, options_str );
+  if ( name == "preparation" )     return new preparation_t( this, options_str );
   if ( name == "mutilate" )        return new mutilate_t( this, options_str );
   if ( name == "shank" )           return new shank_t( this, options_str );
   if ( name == "ambush" )          return new ambush_t( this, options_str );
@@ -712,6 +967,7 @@ void rogue_t::init_gains()
 
   gain.relentless_strikes = get_gain( "relentless_strikes" );
   gain.seal_fate          = get_gain( "seal_fate" );
+  gain.combo_talents      = get_gain( "combo_point_talents" );
 }
 
 void rogue_t::init_procs()
@@ -721,6 +977,11 @@ void rogue_t::init_procs()
   proc.seal_fate      = get_proc( "seal_fate" );
   proc.instant_poison = get_proc( "instant_poison" );
   proc.deadly_poison  = get_proc( "deadly_poison" );
+  proc.improved_backstab = get_proc( "improved_backstab" );
+  proc.ruthlessness      = get_proc( "ruthlessness" );
+  proc.initiative        = get_proc( "initiative" );
+  proc.boot_knife        = get_proc( "boot_knife" );
+  proc.hack_and_slash    = get_proc( "hack_and_slash_extra_attack" );
 }
 
 void rogue_t::create_actions()
@@ -738,6 +999,12 @@ void rogue_t::create_actions()
     deadly_poison_enchant = dp->spell();
     deadly_poison         = new deadly_poison_t( this );
   }
+
+  // Hack and Slash' ekstra slag (oekse/svaerd), et pr. haand
+  if ( talent.hack_and_slash.ok() && equipped_weapons[ SLOT_MAIN_HAND ].type != WEAPON_NONE )
+    hack_and_slash_mh = new hack_and_slash_attack_t( "hack_and_slash_main_hand", this, &equipped_weapons[ SLOT_MAIN_HAND ] );
+  if ( talent.hack_and_slash.ok() && has_off_hand() )
+    hack_and_slash_oh = new hack_and_slash_attack_t( "hack_and_slash_off_hand", this, &equipped_weapons[ SLOT_OFF_HAND ] );
 
   parse_player_effects_t::create_actions();
 }
@@ -762,7 +1029,15 @@ void rogue_t::create_buffs()
 
   buff.venom = make_buff_fallback( talent.venom.ok(), this, "venom", find_spell( 1310703 ) );
 
+  buff.ghostly_strike = make_buff_fallback( talent.ghostly_strike.ok(), this, "ghostly_strike", find_spell( 1329326 ) )
+                          ->set_cooldown( 0_ms );
+  buff.hemorrhage = make_buff_fallback( talent.hemorrhage.ok(), this, "hemorrhage", talent.hemorrhage )
+                      ->set_cooldown( 0_ms )
+                      ->set_max_stack( 1 );
+
   seal_fate_icd = get_cooldown( "seal_fate_icd" );
+  ruthlessness_icd = get_cooldown( "ruthlessness_icd" );
+  hack_and_slash_icd = get_cooldown( "hack_and_slash_icd" );
 }
 
 void rogue_t::init_finished()
@@ -835,6 +1110,18 @@ void rogue_t::init_spells()
     spell_container_t().set_spell( 11269 ),  // 58
   };
 
+  rank.backstab = { this,
+    spell_container_t().set_spell(    53 ),  // 4
+    spell_container_t().set_spell(  2589 ),  // 12
+    spell_container_t().set_spell(  2590 ),  // 20
+    spell_container_t().set_spell(  2591 ),  // 28
+    spell_container_t().set_spell(  8721 ),  // 36
+    spell_container_t().set_spell( 11279 ),  // 44
+    spell_container_t().set_spell( 11280 ),  // 52
+    spell_container_t().set_spell( 11281 ),  // 60
+    spell_container_t().set_spell( 25300 ),  // 60
+  };
+
   rank.shank = { this,
     spell_container_t().set_spell( 1329283 ),  // 24
     spell_container_t().set_spell( 1329549 ),  // 44
@@ -875,6 +1162,14 @@ void rogue_t::init_spells()
   talent.relentless_strikes        = find_talent_spell( talent_tree::CLASS, "Relentless Strikes" );
   talent.seal_fate                 = find_talent_spell( talent_tree::CLASS, "Seal Fate" );
   talent.venom                     = find_talent_spell( talent_tree::CLASS, "Venom" );
+  talent.boot_knife                = find_talent_spell( talent_tree::CLASS, "Boot Knife" );
+  talent.ghostly_strike            = find_talent_spell( talent_tree::CLASS, "Ghostly Strike" );
+  talent.hemorrhage                = find_talent_spell( talent_tree::CLASS, "Hemorrhage" );
+  talent.initiative                = find_talent_spell( talent_tree::CLASS, "Initiative" );
+  talent.premeditation             = find_talent_spell( talent_tree::CLASS, "Premeditation" );
+  talent.preparation               = find_talent_spell( talent_tree::CLASS, "Preparation" );
+  talent.puncturing_wounds         = find_talent_spell( talent_tree::CLASS, "Puncturing Wounds" );
+  talent.ruthlessness              = find_talent_spell( talent_tree::CLASS, "Ruthlessness" );
 
   parse_all_class_passives();
   // Talenternes passive effekter direkte fra spildata (som warlock, warrior, mage m.fl.):
