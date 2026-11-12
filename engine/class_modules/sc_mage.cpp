@@ -5,8 +5,10 @@
 //
 // AULA-RETTELSE (simc-worker/patches/mage.patch i AULA-Guild):
 // Grov basismodel for Forever-mage, bygget efter warlock-modulets skabelon.
-// Kun spells der ikke afhaenger af talenter (rank efter spillerens level),
-// ingen talent-effekter. Wand (Shoot) og Evocation til mana-styring.
+// Kun spells der ikke afhaenger af talenter (rank efter spillerens level).
+// Talenternes passive effekter laeses fra spildata (parse_all_passive_talents);
+// talent-spells, procs og frossen-tilstand er ikke med. Wand (Shoot) og
+// Evocation til mana-styring.
 // Alle tal kommer fra spildata og vaabendata.
 // Fjernes naar upstream selv implementerer klassen.
 
@@ -39,6 +41,11 @@ struct mage_t final : public parse_player_effects_t
   {
     buff_t* evocation;
   } buff;
+
+  struct
+  {
+    player_talent_t wand_specialization;
+  } talent;
 
   struct
   {
@@ -180,6 +187,15 @@ struct shoot_t : public mage_spell_t
   timespan_t execute_time() const override
   { return base_execute_time; }
 
+  // Wand Specialization: +13/25 % wand-skade (rank-vaerdien fra spildataens kurve).
+  double composite_da_multiplier( const action_state_t* s ) const override
+  {
+    double m = mage_spell_t::composite_da_multiplier( s );
+    if ( p()->talent.wand_specialization.ok() )
+      m *= 1.0 + p()->talent.wand_specialization->effectN( 1 ).percent();
+    return m;
+  }
+
   bool ready() override
   {
     if ( !has_wand() )
@@ -316,8 +332,17 @@ void mage_t::init_spells()
     spell_container_t().set_spell( 25304 ),  // 60
   };
 
-  // Kun klassens passiver; talenter laeses bevidst ikke (grov model).
   parse_all_class_passives();
+  // Talenternes passive effekter direkte fra spildata (som warlock, priest, shaman m.fl.):
+  // Add Flat/Percent Modifier paa de beroerte spells (fx Improved Frostbolt, Ice Shards,
+  // Arcane Impact) og spillerstats (fx Precision, Arcane Mind, Arcane Instability).
+  parse_all_passive_talents();
+
+  // Wand Specialization (6057) er i spildata Modify Damage Done% for alle magiske skoler med
+  // kravet "Requires weapon: Wand", som simc ikke ser; registreret ville den give ALLE spells
+  // bonussen. Den fjernes derfor (som i priest-modulet) og laegges kun paa Shoot.
+  talent.wand_specialization = find_talent_spell( talent_tree::CLASS, "Wand Specialization" );
+  deregister_passive_spell( talent.wand_specialization );
 }
 
 void mage_t::init_action_list()
