@@ -9,8 +9,10 @@
 // fra spildata (parse_all_passive_talents). Frost-pakken: Ice Lance, frossen
 // tilstand (Frostbite), Fingers of Frost, Shatter og Ice Barrier. Fire-pakken:
 // Scorch, Pyroblast, Ignite, Improved Scorch (Fire Vulnerability), Heating Up,
-// Combustion, Master of Elements og Fire Power. Wand (Shoot) og Evocation til
-// mana-styring. APL'en vaelger rotation ud fra de valgte talenter.
+// Combustion, Master of Elements og Fire Power. Arcane-pakken: Arcane Blast
+// (stakke), Arcane Wrath, Missile Barrage, Arcane Concentration (Clearcasting),
+// Presence of Mind og Arcane Power. Wand (Shoot) og Evocation til mana-styring.
+// APL'en vaelger rotation ud fra de valgte talenter.
 // Alle tal kommer fra spildata og vaabendata.
 // Fjernes naar upstream selv implementerer klassen.
 
@@ -70,8 +72,12 @@ struct mage_t final : public parse_player_effects_t
   // Frostbolts Chill ramte: Frostbite (frys) og Fingers of Frost kan udloeses.
   void trigger_chill( action_state_t* s );
 
-  // Direkte skadeshit fra en af magens spells: Ignite, Combustion, Heating Up, Master of Elements.
-  void trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source );
+  // Direkte skadeshit fra en af magens spells: Ignite, Combustion, Heating Up, Master of Elements,
+  // Missile Barrage (barrage_mul = andel af talentets chance) og Arcane Concentration.
+  void trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source, double barrage_mul );
+
+  // Arcane Blast-stakke: +12 % af Intellect som spell damage pr. stak (400573 effekt 1, aura 174).
+  double composite_spell_power( school_e school ) const override;
 
   // Fire Power: antal af magens Fire-effekter paa maalet (hoejst 4).
   int fire_effects_on( player_t* t ) const;
@@ -95,7 +101,14 @@ struct mage_t final : public parse_player_effects_t
     buff_t* heating_up;
     buff_t* combustion;       // 11129: tilbagevaerende crits (3)
     buff_t* combustion_crit;  // 28682: +10 % crit pr. stak paa Fire-spells
+    buff_t* arcane_blast;
+    buff_t* missile_barrage;
+    buff_t* clearcasting;
+    buff_t* presence_of_mind;
+    buff_t* arcane_power;
   } buff;
+
+  cooldown_t* arcane_concentration_icd = nullptr;
 
   struct
   {
@@ -112,6 +125,12 @@ struct mage_t final : public parse_player_effects_t
     player_talent_t master_of_elements;
     player_talent_t fire_power;
     player_talent_t combustion;
+    player_talent_t arcane_blast;
+    player_talent_t arcane_wrath;
+    player_talent_t missile_barrage;
+    player_talent_t arcane_concentration;
+    player_talent_t presence_of_mind;
+    player_talent_t arcane_power;
   } talent;
 
   struct
@@ -126,6 +145,10 @@ struct mage_t final : public parse_player_effects_t
     spell_ranks_t scorch;
     spell_ranks_t pyroblast;
     spell_ranks_t combustion;
+    spell_ranks_t arcane_blast;
+    spell_ranks_t arcane_wrath;
+    spell_ranks_t presence_of_mind;
+    spell_ranks_t arcane_power;
   } rank;
 };
 
@@ -180,6 +203,13 @@ public:
       // +10 % crit pr. stak paa Fire-spells. Begge virker kun paa spildataens beroerte spells.
       this->parse_effects( p()->buff.heating_up );
       this->parse_effects( p()->buff.combustion_crit );
+      // Arcane Blast-stakke (+100 % mana-pris paa Arcane Blast pr. stak), Missile Barrage (Arcane
+      // Missiles: -50 % varighed, -100 % mana), Presence of Mind (-100 % cast-tid) og Arcane Power
+      // (+30 % skade og mana-pris). Clearcasting haandteres nedenfor (spildataens -1000 er tiendedele).
+      this->parse_effects( p()->buff.arcane_blast );
+      this->parse_effects( p()->buff.missile_barrage );
+      this->parse_effects( p()->buff.presence_of_mind );
+      this->parse_effects( p()->buff.arcane_power );
     }
   }
 
@@ -196,6 +226,23 @@ public:
   bool frozen_cast = false;
   // Heating Up taeller ikke-periodiske crits fra Fireball, Fire Blast og Scorch.
   bool heating_up_source = false;
+  // Missile Barrage: Arcane Blast har fuld chance, Arcane Wrath, Fireball og Frostbolt halv.
+  double barrage_mul = 0.0;
+  // Clearcasting (12536): denne cast er gratis (buffen er brugt ved execute).
+  bool clearcasting_cast = false;
+
+  bool affected_by_clearcasting() const
+  {
+    return this->harmful && p()->talent.arcane_concentration.ok() &&
+           this->data().affected_by( p()->buff.clearcasting->data().effectN( 1 ) );
+  }
+
+  double cost_pct_multiplier() const override
+  {
+    if ( clearcasting_cast || ( p()->buff.clearcasting->check() && affected_by_clearcasting() ) )
+      return 0.0;
+    return ab::cost_pct_multiplier();
+  }
 
   bool target_frozen( player_t* t ) const
   { return p()->buff.fingers_of_frost->check() || p()->get_target_data( t )->debuff.frozen->check(); }
@@ -205,8 +252,24 @@ public:
     bool use = affected_by_frozen && this->harmful && !this->background;
     bool fof = use && p()->buff.fingers_of_frost->check();
     frozen_cast = use && target_frozen( this->target );
+
+    // Clearcasting: "your next damage spell" -> bruges af denne cast (prisen er 0, se ovenfor).
+    clearcasting_cast = p()->buff.clearcasting->check() && affected_by_clearcasting();
+    if ( clearcasting_cast )
+      p()->buff.clearcasting->expire();
+    // Presence of Mind: bruges af naeste spell med cast-tid (cast-tiden er allerede regnet ud).
+    bool pom = p()->buff.presence_of_mind->check() && this->base_execute_time > 0_ms &&
+               this->data().affected_by( p()->buff.presence_of_mind->data().effectN( 1 ) );
+
     ab::execute();
     frozen_cast = false;
+    clearcasting_cast = false;
+    if ( pom )
+    {
+      p()->buff.presence_of_mind->expire();
+      // "Cooldown On Event": nedkoelingen starter, naar effekten er brugt.
+      p()->get_cooldown( "presence_of_mind" )->start( p()->buff.presence_of_mind->data().cooldown() );
+    }
     // Fingers of Frost: "your next N spells" -> en ladning pr. kastet spell.
     if ( fof )
       p()->buff.fingers_of_frost->decrement();
@@ -216,8 +279,11 @@ public:
   void impact( action_state_t* s ) override
   {
     ab::impact( s );
-    if ( this->harmful && s->result_type == result_amount_type::DMG_DIRECT && this->result_is_hit( s->result ) )
-      p()->trigger_direct_procs( this, s, heating_up_source );
+    // De enkelte Arcane Missiles er "direct ticks" (hver er et selvstaendigt spell-hit); kanalen selv
+    // giver ingen skade (result_raw = 0).
+    if ( this->harmful && ( s->result_type == result_amount_type::DMG_DIRECT || this->direct_tick ) &&
+         this->result_is_hit( s->result ) && s->result_raw > 0 )
+      p()->trigger_direct_procs( this, s, heating_up_source, barrage_mul );
   }
 
   // Improved Scorch (Fire Vulnerability, +3 % pr. stak) og Fire Power (+1-3 % pr. Fire-effekt
@@ -261,6 +327,7 @@ struct frostbolt_t : public mage_spell_t
     mage_spell_t( "frostbolt", player, player->rank.frostbolt.find_rank()->spell() )
   {
     parse_options( options_str );
+    barrage_mul = 0.5;
   }
 
   // Frostbolts effekt 1 (Decrease Movement Speed) er en Chill-effekt; den lander kun ved hit.
@@ -324,6 +391,7 @@ struct fireball_t : public mage_spell_t
   {
     parse_options( options_str );
     heating_up_source = true;
+    barrage_mul = 0.5;
   }
 };
 
@@ -454,6 +522,116 @@ struct arcane_missiles_t : public mage_spell_t
     may_miss = may_crit = false;
     tick_action = new arcane_missile_t( player );
   }
+
+  // Missile Barrage (400589): varighed -50 % og mana -100 % (parse_effects, mens buffen er oppe
+  // ved execute); effekt 2: missilerne kommer hver 1000 - 500 ms. Samme antal missiler, halv tid.
+  bool barrage_channel = false;
+
+  timespan_t tick_time( const action_state_t* s ) const override
+  {
+    timespan_t t = mage_spell_t::tick_time( s );
+    if ( barrage_channel )
+      t += timespan_t::from_millis( p()->buff.missile_barrage->data().effectN( 2 ).base_value() );
+    return t;
+  }
+
+  void execute() override
+  {
+    barrage_channel = p()->buff.missile_barrage->check() > 0;
+    mage_spell_t::execute();
+    if ( barrage_channel )
+      p()->buff.missile_barrage->expire();
+  }
+
+  void last_tick( dot_t* d ) override
+  {
+    mage_spell_t::last_tick( d );
+    barrage_channel = false;
+  }
+};
+
+// Arcane Blast (talent 400574; ranks 1239696-1239700 kraever talentet): 1,5 s cast. Efter hver cast
+// en stak 400573 (op til 4; 18 s fra foerste stak, fornyes ikke): +12 % af Intellect som spell
+// damage og +100 % mana-pris paa Arcane Blast pr. stak. Fuld Missile Barrage-chance.
+struct arcane_blast_t : public mage_spell_t
+{
+  arcane_blast_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "arcane_blast", player, player->rank.arcane_blast.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    barrage_mul = 1.0;
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.arcane_blast->trigger();
+  }
+};
+
+// Arcane Wrath (talent 1326079; ranks 1326080-1326082): 3,5 s cast, 6 s nedkoeling, projektil.
+// Effekt 2: ekstra spell damage = 5 % af max mana (koefficient 1). Halv Missile Barrage-chance.
+struct arcane_wrath_t : public mage_spell_t
+{
+  arcane_wrath_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "arcane_wrath", player, player->rank.arcane_wrath.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    barrage_mul = 0.5;
+  }
+
+  double composite_total_spell_power() const override
+  {
+    return mage_spell_t::composite_total_spell_power() +
+           data().effectN( 2 ).percent() * p()->resources.max[ RESOURCE_MANA ];
+  }
+};
+
+// Presence of Mind (talent 12043): ingen GCD; naeste spell med cast-tid bliver instant. 180 s
+// nedkoeling, der ifoelge spildata ("Cooldown On Event") starter, naar effekten er brugt.
+struct presence_of_mind_t : public mage_spell_t
+{
+  presence_of_mind_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "presence_of_mind", player, player->rank.presence_of_mind.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = player;
+  }
+
+  void update_ready( timespan_t ) override {}
+
+  bool ready() override
+  {
+    if ( p()->buff.presence_of_mind->check() )
+      return false;
+    return mage_spell_t::ready();
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.presence_of_mind->trigger();
+  }
+};
+
+// Arcane Power (talent 12042): ingen GCD, 15 s +30 % skade og +30 % mana-pris (buffen via
+// parse_effects), 180 s nedkoeling.
+struct arcane_power_t : public mage_spell_t
+{
+  arcane_power_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "arcane_power", player, player->rank.arcane_power.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = player;
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.arcane_power->trigger();
+  }
 };
 
 // Shoot (wand, 5019): et skud med den udstyrede wand i ranged-pladsen. Spildataen siger
@@ -558,6 +736,14 @@ action_t* mage_t::create_action( std::string_view name, std::string_view options
     return new pyroblast_t( this, options_str );
   if ( name == "combustion" )
     return new combustion_t( this, options_str );
+  if ( name == "arcane_blast" )
+    return new arcane_blast_t( this, options_str );
+  if ( name == "arcane_wrath" )
+    return new arcane_wrath_t( this, options_str );
+  if ( name == "presence_of_mind" )
+    return new presence_of_mind_t( this, options_str );
+  if ( name == "arcane_power" )
+    return new arcane_power_t( this, options_str );
 
   return parse_player_effects_t::create_action( name, options_str );
 }
@@ -594,6 +780,36 @@ void mage_t::create_buffs()
   auto const combustion = rank.combustion.find_rank()->spell();
   buff.combustion = make_buff_fallback( combustion->ok(), this, "combustion", combustion )->set_cooldown( 0_ms );
   buff.combustion_crit = make_buff_fallback( combustion->ok(), this, "combustion_crit", find_spell( 28682 ) );
+
+  // Arcane Blast (400573): 4 stak, 18 s fra foerste stak (varigheden fornyes ikke).
+  auto const arcane_blast = rank.arcane_blast.find_rank()->spell();
+  buff.arcane_blast = make_buff_fallback( arcane_blast->ok(), this, "arcane_blast", find_spell( 400573 ) );
+  if ( arcane_blast->ok() )
+    buff.arcane_blast->set_refresh_behavior( buff_refresh_behavior::DISABLED )
+                     ->add_invalidate( CACHE_SPELL_POWER );
+
+  // Missile Barrage (400589, 15 s) og Clearcasting (12536, 15 s).
+  buff.missile_barrage = make_buff_fallback( talent.missile_barrage.ok(), this, "missile_barrage", find_spell( 400589 ) );
+  buff.clearcasting = make_buff_fallback( talent.arcane_concentration.ok(), this, "clearcasting", find_spell( 12536 ) );
+
+  auto const pom = rank.presence_of_mind.find_rank()->spell();
+  buff.presence_of_mind = make_buff_fallback( pom->ok(), this, "presence_of_mind", pom )->set_cooldown( 0_ms );
+  auto const ap = rank.arcane_power.find_rank()->spell();
+  buff.arcane_power = make_buff_fallback( ap->ok(), this, "arcane_power", ap )->set_cooldown( 0_ms );
+
+  if ( talent.arcane_concentration.ok() )
+  {
+    arcane_concentration_icd = get_cooldown( "arcane_concentration_icd" );
+    arcane_concentration_icd->duration = talent.arcane_concentration->internal_cooldown();
+  }
+}
+
+double mage_t::composite_spell_power( school_e school ) const
+{
+  double sp = parse_player_effects_t::composite_spell_power( school );
+  if ( buff.arcane_blast->check() )
+    sp += buff.arcane_blast->check() * buff.arcane_blast->data().effectN( 1 ).percent() * cache.intellect();
+  return sp;
 }
 
 int mage_t::fire_effects_on( player_t* t ) const
@@ -608,8 +824,22 @@ int mage_t::fire_effects_on( player_t* t ) const
   return std::min( n, 4 );
 }
 
-void mage_t::trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source )
+void mage_t::trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source, double barrage_mul )
 {
+  // Missile Barrage (400588): 20/40 % fra Arcane Blast, halvdelen fra Arcane Wrath, Fireball, Frostbolt.
+  if ( barrage_mul > 0 && talent.missile_barrage.ok() &&
+       rng().roll( barrage_mul * talent.missile_barrage->effectN( 1 ).percent() ) )
+    buff.missile_barrage->trigger();
+
+  // Arcane Concentration (11213): 2-10 % efter ethvert skadeshit (ogsaa wand og de enkelte
+  // missiler: proc-flagene omfatter "White Ranged"), hoejst en gang pr. sekund (ICD fra spildata).
+  if ( talent.arcane_concentration.ok() && arcane_concentration_icd->up() &&
+       rng().roll( talent.arcane_concentration->effectN( 1 ).percent() ) )
+  {
+    buff.clearcasting->trigger();
+    arcane_concentration_icd->start();
+  }
+
   school_e school = a->get_school();
   bool crit = s->result == RESULT_CRIT;
 
@@ -706,6 +936,36 @@ void mage_t::init_spells()
 
   rank.combustion = { this, talent.combustion,
     spell_container_t().set_spell( 11129 ),  // 40
+  };
+
+  talent.arcane_blast         = find_talent_spell( talent_tree::CLASS, "Arcane Blast" );
+  talent.arcane_wrath         = find_talent_spell( talent_tree::CLASS, "Arcane Wrath" );
+  talent.missile_barrage      = find_talent_spell( talent_tree::CLASS, "Missile Barrage" );
+  talent.arcane_concentration = find_talent_spell( talent_tree::CLASS, "Arcane Concentration" );
+  talent.presence_of_mind     = find_talent_spell( talent_tree::CLASS, "Presence of Mind" );
+  talent.arcane_power         = find_talent_spell( talent_tree::CLASS, "Arcane Power" );
+
+  rank.arcane_blast = { this, talent.arcane_blast,
+    spell_container_t().set_spell(  400574 ),  // 20
+    spell_container_t().set_spell( 1239696 ),  // 30
+    spell_container_t().set_spell( 1239697 ),  // 40
+    spell_container_t().set_spell( 1239699 ),  // 50
+    spell_container_t().set_spell( 1239700 ),  // 60
+  };
+
+  rank.arcane_wrath = { this, talent.arcane_wrath,
+    spell_container_t().set_spell( 1326079 ),  // 25
+    spell_container_t().set_spell( 1326080 ),  // 36
+    spell_container_t().set_spell( 1326081 ),  // 48
+    spell_container_t().set_spell( 1326082 ),  // 60
+  };
+
+  rank.presence_of_mind = { this, talent.presence_of_mind,
+    spell_container_t().set_spell( 12043 ),  // 1
+  };
+
+  rank.arcane_power = { this, talent.arcane_power,
+    spell_container_t().set_spell( 12042 ),  // 1
   };
 
   rank.scorch = { this,
