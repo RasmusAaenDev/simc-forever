@@ -5,10 +5,10 @@
 //
 // AULA-RETTELSE (simc-worker/patches/mage.patch i AULA-Guild):
 // Grov basismodel for Forever-mage, bygget efter warlock-modulets skabelon.
-// Kun spells der ikke afhaenger af talenter (rank efter spillerens level).
-// Talenternes passive effekter laeses fra spildata (parse_all_passive_talents);
-// talent-spells, procs og frossen-tilstand er ikke med. Wand (Shoot) og
-// Evocation til mana-styring.
+// Spells med rank efter spillerens level. Talenternes passive effekter laeses
+// fra spildata (parse_all_passive_talents). Frost-pakken: Ice Lance, frossen
+// tilstand (Frostbite), Fingers of Frost, Shatter og Ice Barrier. Wand (Shoot)
+// og Evocation til mana-styring.
 // Alle tal kommer fra spildata og vaabendata.
 // Fjernes naar upstream selv implementerer klassen.
 
@@ -19,6 +19,19 @@
 
 namespace mage
 {
+struct mage_t;
+
+// Maalets tilstand: "frozen" = Frostbite (12494, Root, 5 s) fra Frostbolts Chill.
+struct mage_td_t final : public actor_target_data_t
+{
+  struct
+  {
+    buff_t* frozen;
+  } debuff;
+
+  mage_td_t( player_t* target, mage_t& p );
+};
+
 struct mage_t final : public parse_player_effects_t
 {
   mage_t( sim_t* sim, std::string_view name, race_e r = RACE_NONE ) :
@@ -37,14 +50,35 @@ struct mage_t final : public parse_player_effects_t
   void create_buffs() override;
   void init_finished() override;
 
+  target_specific_t<mage_td_t> target_data;
+
+  mage_td_t* get_target_data( player_t* target ) const override
+  {
+    mage_td_t*& td = target_data[ target ];
+    if ( !td )
+      td = new mage_td_t( target, const_cast<mage_t&>( *this ) );
+    return td;
+  }
+
+  // Frostbolts Chill ramte: Frostbite (frys) og Fingers of Frost kan udloeses.
+  void trigger_chill( action_state_t* s );
+
   struct
   {
     buff_t* evocation;
+    buff_t* fingers_of_frost;
+    buff_t* ice_barrier;
+    buff_t* frigid_power;
   } buff;
 
   struct
   {
     player_talent_t wand_specialization;
+    player_talent_t frostbite;
+    player_talent_t fingers_of_frost;
+    player_talent_t shatter;
+    player_talent_t ice_lance;
+    player_talent_t ice_barrier;
   } talent;
 
   struct
@@ -54,8 +88,15 @@ struct mage_t final : public parse_player_effects_t
     spell_ranks_t fire_blast;
     spell_ranks_t fireball;
     spell_ranks_t frostbolt;
+    spell_ranks_t ice_lance;
+    spell_ranks_t ice_barrier;
   } rank;
 };
+
+inline mage_td_t::mage_td_t( player_t* target, mage_t& p ) : actor_target_data_t( target, &p )
+{
+  debuff.frozen = make_buff_fallback( p.talent.frostbite.ok() && target->is_enemy(), *this, "frozen", p.find_spell( 12494 ) );
+}
 
 // MAGE MODULE INTERFACE ====================================================
 
@@ -89,13 +130,52 @@ public:
   using base_t = mage_action_t<Base>;
 
   template <typename... Args>
-  mage_action_t( Args&&... args ) : ab( std::forward<Args>( args )... ) {}
+  mage_action_t( Args&&... args ) : ab( std::forward<Args>( args )... )
+  {
+    // Ice Barrier effekt 2 og Frigid Power effekt 1: Add Percent Modifier (Spell Direct Amount)
+    // paa Frost-spells; virker pr. handling, mens buffen er oppe (som druidens Clearcasting).
+    if ( this->data().ok() )
+    {
+      this->parse_effects( p()->buff.ice_barrier );
+      this->parse_effects( p()->buff.frigid_power );
+    }
+  }
 
   mage_t* p()
   { return debug_cast<mage_t*>( this->player ); }
 
   const mage_t* p() const
   { return debug_cast<const mage_t*>( this->player ); }
+
+  // Frossen-tilstand for denne cast: maalet er frosset (Frostbite), eller Fingers of Frost
+  // behandler maalet som frosset. Afgoeres ved execute, hvor crit og skade beregnes.
+  // Shoot (wand, auto-repeat) og spells paa magen selv er ikke omfattet.
+  bool affected_by_frozen = true;
+  bool frozen_cast = false;
+
+  bool target_frozen( player_t* t ) const
+  { return p()->buff.fingers_of_frost->check() || p()->get_target_data( t )->debuff.frozen->check(); }
+
+  void execute() override
+  {
+    bool use = affected_by_frozen && this->harmful && !this->background;
+    bool fof = use && p()->buff.fingers_of_frost->check();
+    frozen_cast = use && target_frozen( this->target );
+    ab::execute();
+    frozen_cast = false;
+    // Fingers of Frost: "your next N spells" -> en ladning pr. kastet spell.
+    if ( fof )
+      p()->buff.fingers_of_frost->decrement();
+  }
+
+  // Shatter (11170): +17/33/50 % crit (talentkurven) for alle spells mod frosne maal.
+  double composite_target_crit_chance( player_t* t ) const override
+  {
+    double c = ab::composite_target_crit_chance( t );
+    if ( frozen_cast && p()->talent.shatter.ok() )
+      c += p()->talent.shatter->effectN( 1 ).percent();
+    return c;
+  }
 };
 
 using mage_spell_t = mage_action_t<spell_t>;
@@ -107,6 +187,58 @@ struct frostbolt_t : public mage_spell_t
     mage_spell_t( "frostbolt", player, player->rank.frostbolt.find_rank()->spell() )
   {
     parse_options( options_str );
+  }
+
+  // Frostbolts effekt 1 (Decrease Movement Speed) er en Chill-effekt; den lander kun ved hit.
+  void impact( action_state_t* s ) override
+  {
+    mage_spell_t::impact( s );
+    if ( result_is_hit( s->result ) )
+      p()->trigger_chill( s );
+  }
+};
+
+// Ice Lance (talent 1312002; hoejere ranks 400640, 1240044-1240047 kraever talentet).
+// Instant, 8 s nedkoeling; effekt 2: +300 % skade mod frosne maal. Spildataen har ingen
+// spell power-koefficient paa skadeeffekten, saa skaden er kun rankens basisvaerdi.
+struct ice_lance_t : public mage_spell_t
+{
+  ice_lance_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "ice_lance", player, player->rank.ice_lance.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+
+  double composite_target_da_multiplier( player_t* t ) const override
+  {
+    double m = mage_spell_t::composite_target_da_multiplier( t );
+    if ( frozen_cast )
+      m *= 1.0 + data().effectN( 2 ).percent();
+    return m;
+  }
+};
+
+// Ice Barrier (talent 11426, ranks 13031-13033): skjold paa magen selv i 60 s. Effekt 2
+// (+5 % direkte Frost-skade, mens skjoldet holder) ligger paa buffen; beskrivelsen siger
+// desuden Frigid Power (1326891: +15 % Frost-skade i 60 s). Absorberingen modelleres ikke
+// (magen tager ingen skade), saa skjoldet holder hele varigheden.
+struct ice_barrier_t : public mage_spell_t
+{
+  ice_barrier_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "ice_barrier", player, player->rank.ice_barrier.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = player;
+    // Effekt 1 (Absorb Damage) er ikke skade; uden dette taeller simc den som direkte skade.
+    base_dd_min = base_dd_max = 0.0;
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.ice_barrier->trigger();
+    p()->buff.frigid_power->trigger();
   }
 };
 
@@ -166,6 +298,7 @@ struct shoot_t : public mage_spell_t
     mage_spell_t( "shoot", player, player->find_spell( 5019 ) )
   {
     parse_options( options_str );
+    affected_by_frozen = false;
 
     weapon            = &player->equipped_weapons[ SLOT_RANGED ];
     weapon_multiplier = 1.0;
@@ -245,6 +378,10 @@ action_t* mage_t::create_action( std::string_view name, std::string_view options
     return new evocation_t( this, options_str );
   if ( name == "shoot" )
     return new shoot_t( this, options_str );
+  if ( name == "ice_lance" )
+    return new ice_lance_t( this, options_str );
+  if ( name == "ice_barrier" )
+    return new ice_barrier_t( this, options_str );
 
   return parse_player_effects_t::create_action( name, options_str );
 }
@@ -263,6 +400,27 @@ void mage_t::create_buffs()
   buff.evocation = make_buff_fallback( evocation->ok(), this, "evocation", evocation )
                      ->set_cooldown( 0_ms )
                      ->set_affects_regen( true );
+
+  // Fingers of Frost (400647 -> 400669, 15 s): ladninger = talentets effekt 1 (1/2 efter rank).
+  buff.fingers_of_frost = make_buff_fallback( talent.fingers_of_frost.ok(), this, "fingers_of_frost", find_spell( 400669 ) );
+  if ( talent.fingers_of_frost.ok() )
+    buff.fingers_of_frost->set_max_stack( as<int>( talent.fingers_of_frost->effectN( 1 ).base_value() ) );
+
+  auto const ice_barrier = rank.ice_barrier.find_rank()->spell();
+  buff.ice_barrier = make_buff_fallback( ice_barrier->ok(), this, "ice_barrier", ice_barrier )
+                       ->set_cooldown( 0_ms );
+  buff.frigid_power = make_buff_fallback( ice_barrier->ok(), this, "frigid_power", find_spell( 1326891 ) );
+}
+
+void mage_t::trigger_chill( action_state_t* s )
+{
+  // Frostbite (11071): 5/10/15 % chance for at fryse maalet (12494, 5 s).
+  if ( talent.frostbite.ok() && rng().roll( talent.frostbite->effectN( 1 ).percent() ) )
+    get_target_data( s->target )->debuff.frozen->trigger();
+
+  // Fingers of Frost (400647): effekt 2 = 15 % chance; buffen faar fulde ladninger.
+  if ( talent.fingers_of_frost.ok() && rng().roll( talent.fingers_of_frost->effectN( 2 ).percent() ) )
+    buff.fingers_of_frost->trigger( buff.fingers_of_frost->max_stack() );
 }
 
 void mage_t::init_finished()
@@ -276,6 +434,29 @@ void mage_t::init_finished()
 void mage_t::init_spells()
 {
   parse_player_effects_t::init_spells();
+
+  talent.frostbite        = find_talent_spell( talent_tree::CLASS, "Frostbite" );
+  talent.fingers_of_frost = find_talent_spell( talent_tree::CLASS, "Fingers of Frost" );
+  talent.shatter          = find_talent_spell( talent_tree::CLASS, "Shatter" );
+  talent.ice_lance        = find_talent_spell( talent_tree::CLASS, "Ice Lance" );
+  talent.ice_barrier      = find_talent_spell( talent_tree::CLASS, "Ice Barrier" );
+
+  // Talent-spells: rank 1 = talentet; hoejere ranks kraever talentet (kommentar = spell level).
+  rank.ice_lance = { this, talent.ice_lance,
+    spell_container_t().set_spell( 1312002 ),  // 20
+    spell_container_t().set_spell(  400640 ),  // 28
+    spell_container_t().set_spell( 1240044 ),  // 34
+    spell_container_t().set_spell( 1240045 ),  // 42
+    spell_container_t().set_spell( 1240046 ),  // 48
+    spell_container_t().set_spell( 1240047 ),  // 56
+  };
+
+  rank.ice_barrier = { this, talent.ice_barrier,
+    spell_container_t().set_spell( 11426 ),  // 40
+    spell_container_t().set_spell( 13031 ),  // 46
+    spell_container_t().set_spell( 13032 ),  // 52
+    spell_container_t().set_spell( 13033 ),  // 58
+  };
 
   rank.evocation = { this,
     spell_container_t().set_spell( 12051 ),  // 20
