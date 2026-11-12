@@ -340,14 +340,20 @@ struct frostbolt_t : public mage_spell_t
 };
 
 // Ice Lance (talent 1312002; hoejere ranks 400640, 1240044-1240047 kraever talentet).
-// Instant, 8 s nedkoeling; effekt 2: +300 % skade mod frosne maal. Spildataen har ingen
-// spell power-koefficient paa skadeeffekten, saa skaden er kun rankens basisvaerdi.
+// Instant, 8 s nedkoeling; effekt 2: +300 % skade mod frosne maal (ganges paa basis + spell power).
+// ANTAGELSE efter brugerens oenske: spildataen har ingen spell power-koefficient paa Ice Lances
+// skadeeffekt, saa Ice Lance laaner koefficienten fra den Frostbolt-rank, spilleren har (spildata).
+// Klassisk har instant-spells normalt lavere koefficient end en 3 s cast: tallet er nok optimistisk.
+// Det ene sted at aendre: linjen med spell_power_mod.direct nedenfor (fjern den = ingen koefficient).
 struct ice_lance_t : public mage_spell_t
 {
   ice_lance_t( mage_t* player, std::string_view options_str ) :
     mage_spell_t( "ice_lance", player, player->rank.ice_lance.find_rank()->spell() )
   {
     parse_options( options_str );
+    for ( const spelleffect_data_t& e : player->rank.frostbolt.find_rank()->spell()->effects() )
+      if ( e.type() == E_SCHOOL_DAMAGE )
+        spell_power_mod.direct = e.sp_coeff();  // ANTAGELSE: Frostbolts koefficient (se ovenfor)
   }
 
   double composite_target_da_multiplier( player_t* t ) const override
