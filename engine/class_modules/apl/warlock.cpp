@@ -35,7 +35,11 @@ void warlock( player_t* p )
   action_priority_list_t* precombat = p->get_action_priority_list( "precombat" );
   action_priority_list_t* default_  = p->get_action_priority_list( "default" );
 
-  precombat->add_action( "summon_imp" );
+  // AULA-RETTELSE: summon_demon tilkalder daemonen efter level og talenter (eller default_pet=). Med Demonic
+  // Sacrifice og Demonic Pact tilkaldes og ofres Imp'en foerst, og den rigtige daemon tilkaldes bagefter.
+  precombat->add_action( "summon_demon" );
+  precombat->add_action( "demonic_sacrifice" );
+  precombat->add_action( "summon_demon" );
 
   // AULA-RETTELSE: Life Tap ved lav mana (livet er uendeligt i simc; antagelse: en healer daekker det),
   // Bane of Agony og Siphon Life som DoTs, og spec-talenterne efter hvad warlocken har laert:

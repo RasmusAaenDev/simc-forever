@@ -1,6 +1,8 @@
 // AULA-RETTELSE (simc-worker/patches/warlock.patch i AULA-Guild): Life Tap, wand (Shoot), Bane of Agony,
 // Siphon Life, Shadowburn, Conflagrate, Incinerate, Wrack, Improved Shadow Bolt og en rotation der vaelger
-// efter talenter. Se PATCHES.md.
+// efter talenter. Daemonerne Imp, Voidwalker, Succubus og Felhunter (valgt efter level og talenter, eller
+// default_pet=), Demonic Sacrifice/Pact, Soul Link, Master Demonologist, Demonic Knowledge, Unholy Power,
+// Improved Imp/Sayaad og Demonic Energies. Se PATCHES.md.
 #include "simulationcraft.hpp"
 #include "action/parse_effects.hpp"
 
@@ -27,11 +29,34 @@ struct warlock_t final : public player_t
   void init_gains() override;
 
   void create_pets() override;
+  void create_options() override;
+  void reset() override;
+  double composite_player_multiplier( school_e ) const override;
+  double composite_spell_power( school_e ) const override;
 
   struct pets_t
   {
     pet_t* imp = nullptr;
+    pet_t* voidwalker = nullptr;
+    pet_t* succubus = nullptr;
+    pet_t* felhunter = nullptr;
   } pets;
+
+  // AULA-RETTELSE: hvilken daemon warlocken har ude, og hvilken den har ofret (Demonic Sacrifice).
+  enum demon_e { DEMON_NONE = 0, DEMON_IMP, DEMON_VOIDWALKER, DEMON_SUCCUBUS, DEMON_FELHUNTER };
+  std::string default_pet_str = "auto";        // default_pet=auto|none|imp|voidwalker|succubus|felhunter
+  std::string demonic_sacrifice_str = "auto";  // demonic_sacrifice=auto|none|imp|succubus
+  demon_e chosen_demon    = DEMON_NONE;  // daemonen ude i kampen (valgt i choose_demons)
+  demon_e sacrifice_demon = DEMON_NONE;  // daemonen der ofres foer kampen
+  demon_e active_demon    = DEMON_NONE;  // daemonen ude lige nu
+  demon_e sacrificed      = DEMON_NONE;  // daemonen hvis Demonic Sacrifice-effekt er oppe
+
+  pet_t* demon_pet( demon_e d ) const;
+  bool demon_available( demon_e d ) const;
+  demon_e next_demon_to_summon() const;
+  void choose_demons();
+  void summon_demon( demon_e d );
+  void sacrifice_active_demon();
 
   struct
   {
@@ -46,6 +71,7 @@ struct warlock_t final : public player_t
     spell_ranks_t conflagrate;
     spell_ranks_t incinerate;
     spell_ranks_t wrack;
+    spell_ranks_t lash_of_pain;
   } rank;
 
   struct
@@ -57,18 +83,35 @@ struct warlock_t final : public player_t
     player_talent_t incinerate;
     player_talent_t wrack;
     player_talent_t improved_shadow_bolt;
+    // Demonology (daemonerne)
+    player_talent_t demonic_sacrifice;
+    player_talent_t demonic_pact;
+    player_talent_t soul_link;
+    player_talent_t master_demonologist;
+    player_talent_t demonic_knowledge;
+    player_talent_t unholy_power;
+    player_talent_t improved_imp;
+    player_talent_t improved_sayaad;
+    player_talent_t demonic_energies;
   } talent;
+
+  const spell_data_t* soul_link_effect = nullptr;  // 25228: +3 % skade for warlock og daemon
 
   struct
   {
     // Improved Shadow Bolt: Shadow Vulnerability (17794). Ligger paa warlocken (kun dens egen skade
     // paavirkes, og Patchwerk har eet maal); med flere maal gaelder den dermed for alle.
     buff_t* shadow_vulnerability = nullptr;
+    // Demonic Sacrifice: ofret Imp = Burning Shadow (18789, +15 % Shadow), ofret Succubus = Touch of Fire
+    // (18791, +15 % Fire). Omvendt af original Classic; spildataen er facit.
+    buff_t* burning_shadow = nullptr;
+    buff_t* touch_of_fire  = nullptr;
   } buff;
 
   struct
   {
     gain_t* life_tap = nullptr;
+    gain_t* life_tap_demon = nullptr;
   } gains;
 
   // Til Conflagrate (forbruger Immolate) og Wrack (forstaerker de andre Shadow-DoTs).
@@ -244,7 +287,13 @@ struct life_tap_t : public warlock_spell_t
   void execute() override
   {
     warlock_spell_t::execute();
-    p()->resource_gain( RESOURCE_MANA, mana_gain(), p()->gains.life_tap, this );
+    double gain = mana_gain();
+    p()->resource_gain( RESOURCE_MANA, gain, p()->gains.life_tap, this );
+    // Demonic Energies (1225214, effekt 2): daemonen ude faar 50/100 % af manaen (wowsims/forever lifetap.go).
+    if ( p()->talent.demonic_energies.ok() )
+      if ( pet_t* d = p()->demon_pet( p()->active_demon ) )
+        d->resource_gain( RESOURCE_MANA, gain * p()->talent.demonic_energies->effectN( 2 ).percent(),
+                          p()->gains.life_tap_demon, this );
   }
 };
 
@@ -361,19 +410,69 @@ struct wrack_t : public warlock_spell_t
   }
 };
 
-struct summon_imp_t final : public warlock_spell_t
+// AULA-RETTELSE: Summon Imp (688, level 1), Voidwalker (697, 10), Succubus (712, 20) og Felhunter (691, 30).
+// summon_demon tilkalder den daemon, warlocken skal have ude (choose_demons), eller foerst den, der skal ofres.
+// Foer kampen (precombat) koster en tilkaldelse ingen mana: antagelse, at warlocken tilkalder og drikker foer
+// pull. I kampen gaelder spildataens pris og 10 s cast (Fel Domination modelleres ikke).
+struct summon_demon_t final : public warlock_spell_t
 {
-  summon_imp_t( warlock_t* player, std::string_view options_str ) :
-    warlock_spell_t( "summon_imp", player, player->find_spell( 688 ) )
+  warlock_t::demon_e which;  // DEMON_NONE = automatisk valg
+
+  summon_demon_t( util::string_view n, warlock_t* player, const spell_data_t* s, warlock_t::demon_e d,
+                  std::string_view options_str ) :
+    warlock_spell_t( n, player, s ), which( d )
   {
     parse_options( options_str );
-    harmful = false;
+    harmful = may_miss = may_crit = callbacks = false;
+    target = player;
+  }
+
+  warlock_t::demon_e demon() const
+  { return which != warlock_t::DEMON_NONE ? which : p()->next_demon_to_summon(); }
+
+  double cost() const override
+  { return player->in_combat ? warlock_spell_t::cost() : 0.0; }
+
+  bool ready() override
+  {
+    auto d = demon();
+    if ( d == warlock_t::DEMON_NONE || d == p()->active_demon || !p()->demon_available( d ) )
+      return false;
+    return warlock_spell_t::ready();
+  }
+
+  void execute() override
+  {
+    auto d = demon();
+    warlock_spell_t::execute();
+    p()->summon_demon( d );
+  }
+};
+
+// Demonic Sacrifice (18788, talent): ofrer daemonen ude og giver warlocken dens effekt (7200 s, dvs. hele
+// kampen), indtil en daemon tilkaldes; med Demonic Pact (425464) kun hvis det er den ofrede daemon igen.
+struct demonic_sacrifice_t final : public warlock_spell_t
+{
+  demonic_sacrifice_t( warlock_t* player, std::string_view options_str ) :
+    warlock_spell_t( "demonic_sacrifice", player, player->talent.demonic_sacrifice )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = callbacks = false;
+    target = player;
+  }
+
+  bool ready() override
+  {
+    if ( !p()->talent.demonic_sacrifice.ok() || p()->active_demon == warlock_t::DEMON_NONE ||
+         p()->active_demon != p()->sacrifice_demon || p()->sacrificed != warlock_t::DEMON_NONE )
+      return false;
+    return warlock_spell_t::ready();
   }
 
   void execute() override
   {
     warlock_spell_t::execute();
-    p()->pets.imp->summon();
+    p()->sacrifice_active_demon();
   }
 };
 
@@ -384,11 +483,31 @@ struct summon_imp_t final : public warlock_spell_t
 ///////////////////////////////////////////
 
 namespace pets {
+  // AULA-RETTELSE: faelles daemon-model efter wowsims/forever sim/warlock/pets.go (MIT; formlerne er skrevet som
+  // andele af creature-vaerdierne, saa de gaelder paa alle level). Fra warlocken: AP = 0,17 x spell damage
+  // (upstream), spell damage = 0,10 x warlockens, warlockens spell crit som daemonens crit (upstream for Imp'en),
+  // spell hit = warlockens, melee hit = 8/17 af den. Mana-regen er en andel af warlockens Intellect som MP5
+  // (Imp 0,30, de andre 0,10; maalt paa level 30). Upstreams Imp-regen (1,65/2,73 mana/s) var kun maalt paa level 7.
   struct warlock_pet_t : public pet_t
   {
-    warlock_pet_t( sim_t* sim, warlock_t* owner, std::string_view pet_name, pet_e pet_type, bool guardian = false ) :
-      pet_t( sim, owner, pet_name, pet_type, guardian, false )
+    warlock_t::demon_e demon;
+    double damage_mod         = 1.0;   // Voidwalker 0,5, Felhunter 0,8 (wowsims damageMod)
+    double mp5_per_owner_int  = 0.10;
+
+    warlock_pet_t( sim_t* sim, warlock_t* owner, std::string_view pet_name, pet_e pet_type, warlock_t::demon_e d ) :
+      pet_t( sim, owner, pet_name, pet_type, false, false ), demon( d )
     {
+      // from level 6-10 imp character sheet (upstream)
+      owner_coeff.armor = 0.35;
+      owner_coeff.ap_from_sp = 0.17;
+      owner_coeff.sp_from_sp = 0.10;
+
+      // TODO: Imp HP looks to come from a table
+      owner_coeff.health = 1.5;
+      stamina_per_owner = 0;
+
+      // matches in-game stats but int might not actually do anything on the pet
+      intellect_per_owner = 0.3;
     }
 
     const warlock_t* o() const
@@ -396,6 +515,69 @@ namespace pets {
 
     warlock_t* o()
     { return static_cast<warlock_t*>( owner ); }
+
+    resource_e primary_resource() const override { return RESOURCE_MANA; }
+
+    // Daemonens manapulje: upstreams Imp-fit (29 + 9,5 x level, maalt paa level 3-8) op til level 8, derefter
+    // lineaert til wowsims' level 60-pulje (576 + 5 x 264 Int = 1896). SKOEN: puljen mellem level 9 og 59 er ikke
+    // maalt, og i spillet viser pet-arket paa level 60 ca. 10.870 mana mere (fra warlocken; wowsims' TODO).
+    void init_base_stats() override
+    {
+      pet_t::init_base_stats();
+      double l = level();
+      double mana = l <= 8 ? 29 + 9.5 * l : 105 + ( 1896.0 - 105.0 ) * ( std::min( l, 60.0 ) - 8 ) / 52.0;
+      resources.base[ RESOURCE_MANA ] = std::floor( mana );
+    }
+
+    double resource_regen_per_second( resource_e r ) const override
+    {
+      if ( r != RESOURCE_MANA )
+        return pet_t::resource_regen_per_second( r );
+      return owner->cache.intellect() * mp5_per_owner_int / 5.0;
+    }
+
+    // Warlockens spell crit (melee og spell), som Imp'en i upstream og wowsims.
+    double pet_crit() const override
+    { return current_pet_stats.composite_spell_crit; }
+
+    double composite_spell_hit() const override
+    { return owner->cache.spell_hit(); }
+
+    double composite_melee_hit() const override
+    { return owner->cache.spell_hit() * 8.0 / 17.0; }
+
+    double composite_melee_expertise( const weapon_t* ) const override
+    { return 0.0; }
+
+    // Demonic Knowledge (412732): + rankens andel af warlockens level i spell damage, mens en daemon er ude.
+    double composite_spell_power( school_e school ) const override
+    {
+      double sp = pet_t::composite_spell_power( school );
+      if ( o()->talent.demonic_knowledge.ok() )
+        sp += o()->level() * o()->talent.demonic_knowledge->effectN( 1 ).percent();
+      return sp;
+    }
+
+    // Daemonens egne multiplikatorer: Unholy Power (18769, +2-10 %), Soul Link (25228, +3 %), Master
+    // Demonologist (23785: Imp +Fire, Succubus +Shadow; Voidwalker/Felhunter er forsvar) og daemonens
+    // basis-modifikator.
+    double composite_player_multiplier( school_e school ) const override
+    {
+      double m = pet_t::composite_player_multiplier( school );
+      m *= damage_mod;
+      if ( o()->talent.unholy_power.ok() )
+        m *= 1.0 + o()->talent.unholy_power->effectN( 1 ).percent();
+      if ( o()->talent.soul_link.ok() && o()->soul_link_effect )
+        m *= 1.0 + o()->soul_link_effect->effectN( 1 ).percent();
+      if ( o()->talent.master_demonologist.ok() )
+      {
+        if ( demon == warlock_t::DEMON_IMP && school == SCHOOL_FIRE )
+          m *= 1.0 + o()->talent.master_demonologist->effectN( 1 ).percent();
+        if ( demon == warlock_t::DEMON_SUCCUBUS && school == SCHOOL_SHADOW )
+          m *= 1.0 + o()->talent.master_demonologist->effectN( 3 ).percent();
+      }
+      return m;
+    }
   };
 
   template <class Base>
@@ -425,49 +607,108 @@ namespace pets {
   using warlock_pet_attack_t = warlock_pet_action_t<melee_attack_t>;
   using warlock_pet_spell_t  = warlock_pet_action_t<spell_t>;
 
+  // Naerkamp for Voidwalker, Succubus og Felhunter: vaabnet er en andel af creature_auto_attack_dps for
+  // daemonens level (expected_stat.inc) x 2,0 s, +/- spredning; AP = 3 x level + 6 (wowsims: linje gennem
+  // Succubus' level 20- og 30-ark) plus 0,17 x warlockens spell damage.
+  struct melee_demon_t : public warlock_pet_t
+  {
+    double swing_share;   // gennemsnitligt slag = swing_share x creature dps x 2,0 s
+    double swing_spread;  // +/- andel
+
+    melee_demon_t( sim_t* sim, warlock_t* owner, std::string_view n, pet_e t, warlock_t::demon_e d, double share,
+                   double spread ) :
+      warlock_pet_t( sim, owner, n, t, d ), swing_share( share ), swing_spread( spread )
+    {}
+
+    void init_base_stats() override
+    {
+      warlock_pet_t::init_base_stats();
+      double avg = swing_share * dbc->expected_stat( level() ).creature_auto_attack_dps * 2.0;
+      equipped_weapons[ SLOT_MAIN_HAND ].type       = WEAPON_BEAST;
+      equipped_weapons[ SLOT_MAIN_HAND ].swing_time = 2_s;
+      equipped_weapons[ SLOT_MAIN_HAND ].min_dmg    = avg * ( 1.0 - swing_spread );
+      equipped_weapons[ SLOT_MAIN_HAND ].max_dmg    = avg * ( 1.0 + swing_spread );
+      equipped_weapons[ SLOT_MAIN_HAND ].damage     = ( equipped_weapons[ SLOT_MAIN_HAND ].min_dmg + equipped_weapons[ SLOT_MAIN_HAND ].max_dmg ) / 2.0;
+    }
+
+    double composite_melee_attack_power() const override
+    { return warlock_pet_t::composite_melee_attack_power() + 3.0 * level() + 6.0; }
+
+    void init_action_list() override
+    {
+      if ( action_list_str.empty() )
+        action_list_str = demon == warlock_t::DEMON_SUCCUBUS ? "auto_attack/lash_of_pain" : "auto_attack";
+      warlock_pet_t::init_action_list();
+    }
+
+    action_t* create_action( std::string_view name, std::string_view options_str ) override;
+  };
+
+  struct demon_melee_t : public warlock_pet_attack_t
+  {
+    demon_melee_t( melee_demon_t* p ) : warlock_pet_attack_t( "melee", p, spell_data_t::nil() )
+    {
+      weapon            = &p->equipped_weapons[ SLOT_MAIN_HAND ];
+      weapon_multiplier = 1.0;
+      base_execute_time = weapon->swing_time;
+      school            = SCHOOL_PHYSICAL;
+      trigger_gcd       = 0_ms;
+      background = repeating = may_glance = may_crit = may_dodge = may_parry = true;
+      special = false;
+    }
+  };
+
+  struct demon_auto_attack_t : public warlock_pet_attack_t
+  {
+    demon_auto_attack_t( melee_demon_t* p, std::string_view options_str ) :
+      warlock_pet_attack_t( "auto_attack", p, spell_data_t::nil() )
+    {
+      parse_options( options_str );
+      trigger_gcd = 0_ms;
+      ignore_false_positive = true;
+      p->main_hand_attack = new demon_melee_t( p );
+    }
+
+    void execute() override
+    { player->main_hand_attack->schedule_execute(); }
+
+    bool ready() override
+    { return player->main_hand_attack->execute_event == nullptr; }
+  };
+
+  // Lash of Pain (7814 ... 11780; 20/28/36/44/52/60): Shadow, 12 s nedkoeling, 0,429 x daemonens spell damage.
+  // Improved Sayaad (18754, effekt 1) oeger skaden.
+  struct lash_of_pain_t : public warlock_pet_spell_t
+  {
+    lash_of_pain_t( melee_demon_t* p, std::string_view options_str ) :
+      warlock_pet_spell_t( "lash_of_pain", p, p->o()->rank.lash_of_pain.find_rank()->spell() )
+    {
+      parse_options( options_str );
+    }
+
+    double composite_da_multiplier( const action_state_t* s ) const override
+    {
+      double m = warlock_pet_spell_t::composite_da_multiplier( s );
+      if ( o()->talent.improved_sayaad.ok() )
+        m *= 1.0 + o()->talent.improved_sayaad->effectN( 1 ).percent();
+      return m;
+    }
+  };
+
+  action_t* melee_demon_t::create_action( std::string_view name, std::string_view options_str )
+  {
+    if ( name == "auto_attack" ) return new demon_auto_attack_t( this, options_str );
+    if ( name == "lash_of_pain" ) return new lash_of_pain_t( this, options_str );
+    return warlock_pet_t::create_action( name, options_str );
+  }
+
   namespace imp {
     struct imp_pet_t : warlock_pet_t
     {
       imp_pet_t( sim_t* sim, warlock_t* owner ) :
-        warlock_pet_t( sim, owner, "imp", PET_IMP )
+        warlock_pet_t( sim, owner, "imp", PET_IMP, warlock_t::DEMON_IMP )
       {
-        // from level 6-10 imp character sheet
-        owner_coeff.armor = 0.35;
-        owner_coeff.ap_from_sp = 0.17;
-
-        // TODO: Imp HP looks to come from a table
-        owner_coeff.health = 1.5;
-        stamina_per_owner = 0;
-
-        // matches in-game stats but int might not actually do anything on the pet
-        intellect_per_owner = 0.3;
-      }
-
-      resource_e primary_resource() const override { return RESOURCE_MANA; }
-
-      // copies owner's crit which matches imp char sheet
-      double pet_crit() const override
-      { return current_pet_stats.composite_spell_crit; }
-
-      double resource_regen_per_second( resource_e r ) const override
-      {
-        if ( r != RESOURCE_MANA )
-        {
-          return pet_t::resource_regen_per_second( r );
-        }
-
-        // TODO - this is at level 7, probably need a table for this
-        return recent_cast() ? 1.65 : 2.73;
-      }
-
-      void init_base_stats() override
-      {
-        warlock_pet_t::init_base_stats();
-
-        // TODO: figure this out - probably another table of int/mana at every level
-        // fit to obsevations level 3-8 but starts to break down at level 9
-        double mana = 29 + (9.5 * level());
-        resources.base[ RESOURCE_MANA ] = std::floor(mana);
+        mp5_per_owner_int = 0.30;
       }
 
       void init_action_list() override
@@ -492,6 +733,15 @@ namespace pets {
         //ability_lag.mean   = 500_ms;
         //ability_lag.stddev = 100_ms;
       }
+
+      // Improved Imp (18694, effekt 2): +10/20/30 % Firebolt-skade.
+      double composite_da_multiplier( const action_state_t* s ) const override
+      {
+        double m = warlock_pet_spell_t::composite_da_multiplier( s );
+        if ( o()->talent.improved_imp.ok() )
+          m *= 1.0 + o()->talent.improved_imp->effectN( 2 ).percent();
+        return m;
+      }
     };
 
     action_t* imp_pet_t::create_action( std::string_view name, std::string_view options_str )
@@ -501,6 +751,180 @@ namespace pets {
       return warlock_pet_t::create_action( name, options_str );
     }
   }
+}
+
+pet_t* warlock_t::demon_pet( demon_e d ) const
+{
+  switch ( d )
+  {
+    case DEMON_IMP:        return pets.imp;
+    case DEMON_VOIDWALKER: return pets.voidwalker;
+    case DEMON_SUCCUBUS:   return pets.succubus;
+    case DEMON_FELHUNTER:  return pets.felhunter;
+    default:               return nullptr;
+  }
+}
+
+// Kan warlocken tilkalde daemonen paa sit level? (Summon-spellens level i spildataen: 1/10/20/30.)
+bool warlock_t::demon_available( demon_e d ) const
+{
+  static const unsigned summon_id[] = { 0, 688, 697, 712, 691 };
+  if ( d == DEMON_NONE )
+    return false;
+  const spell_data_t* s = find_spell( summon_id[ d ] );
+  return s->ok() && level() >= static_cast<int>( s->level() );
+}
+
+warlock_t::demon_e warlock_t::next_demon_to_summon() const
+{
+  if ( sacrifice_demon != DEMON_NONE && sacrificed == DEMON_NONE )
+    return sacrifice_demon;
+  return chosen_demon;
+}
+
+// Daemonvalget (AULA-RETTELSE). Profilen kan selv angive default_pet= og demonic_sacrifice=; ellers (auto):
+// - Daemonen ude: Succubus fra level 20 (den daemon, der goer mest skade, og som specs bruger, naar det gaelder
+//   skade), Voidwalker paa level 10-19 (leveling-guidernes valg), Imp under level 10. Felhunter vaelges aldrig
+//   automatisk (dens evner er utility), men kan vaelges med default_pet=felhunter.
+// - Demonic Sacrifice: kun med Demonic Pact. Saa ofres Imp'en foer kampen (Burning Shadow, +15 % Shadow), og
+//   daemonen ovenfor tilkaldes bagefter (Icy Veins' Demonology-build). Uden Pact beholdes daemonen: maalt i
+//   simc giver Succubus/Voidwalker mere end +15 % Shadow (se PATCHES.md).
+void warlock_t::choose_demons()
+{
+  auto parse = []( std::string v, demon_e& out ) {
+    util::tolower( v );
+    if ( v == "none" ) { out = DEMON_NONE; return true; }
+    if ( v == "imp" ) { out = DEMON_IMP; return true; }
+    if ( v == "voidwalker" ) { out = DEMON_VOIDWALKER; return true; }
+    if ( v == "succubus" || v == "sayaad" ) { out = DEMON_SUCCUBUS; return true; }
+    if ( v == "felhunter" ) { out = DEMON_FELHUNTER; return true; }
+    return false;
+  };
+
+  demon_e best = demon_available( DEMON_SUCCUBUS )     ? DEMON_SUCCUBUS
+                 : demon_available( DEMON_VOIDWALKER ) ? DEMON_VOIDWALKER
+                                                       : DEMON_IMP;
+  chosen_demon    = best;
+  sacrifice_demon = DEMON_NONE;
+
+  if ( !util::str_compare_ci( default_pet_str, "auto" ) )
+  {
+    demon_e d = DEMON_NONE;
+    if ( !parse( default_pet_str, d ) )
+      throw std::invalid_argument( fmt::format( "Unknown default_pet '{}' (auto, none, imp, voidwalker, succubus, felhunter)",
+                                                default_pet_str ) );
+    chosen_demon = d == DEMON_NONE || demon_available( d ) ? d : best;
+  }
+
+  if ( util::str_compare_ci( demonic_sacrifice_str, "auto" ) )
+  {
+    if ( talent.demonic_sacrifice.ok() && talent.demonic_pact.ok() && chosen_demon != DEMON_NONE &&
+         chosen_demon != DEMON_IMP )
+      sacrifice_demon = DEMON_IMP;
+  }
+  else
+  {
+    demon_e d = DEMON_NONE;
+    if ( !parse( demonic_sacrifice_str, d ) || d == DEMON_VOIDWALKER || d == DEMON_FELHUNTER )
+      throw std::invalid_argument( fmt::format( "Unknown demonic_sacrifice '{}' (auto, none, imp, succubus)",
+                                                demonic_sacrifice_str ) );
+    sacrifice_demon = talent.demonic_sacrifice.ok() && demon_available( d ) ? d : DEMON_NONE;
+    // Uden Demonic Pact ophaever en ny daemon effekten: ingen daemon ude.
+    if ( sacrifice_demon != DEMON_NONE && !talent.demonic_pact.ok() )
+      chosen_demon = DEMON_NONE;
+  }
+
+  // Den ofrede daemon kan ikke ogsaa vaere ude (en ny tilkaldelse af den ophaever effekten): med Demonic Pact
+  // tilkaldes i stedet Imp'en (ofret Succubus) eller den bedste anden daemon. (Kun ved demonic_sacrifice=.)
+  if ( sacrifice_demon != DEMON_NONE && chosen_demon == sacrifice_demon )
+    chosen_demon = sacrifice_demon == DEMON_SUCCUBUS ? DEMON_IMP : best != sacrifice_demon ? best : DEMON_NONE;
+}
+
+void warlock_t::summon_demon( demon_e d )
+{
+  if ( pet_t* cur = demon_pet( active_demon ) )
+    cur->dismiss();
+  active_demon = DEMON_NONE;
+
+  // En tilkaldelse ophaever Demonic Sacrifice; med Demonic Pact kun naar det er den ofrede daemon.
+  if ( sacrificed != DEMON_NONE && ( !talent.demonic_pact.ok() || d == sacrificed ) )
+  {
+    buff.burning_shadow->expire();
+    buff.touch_of_fire->expire();
+    sacrificed = DEMON_NONE;
+  }
+
+  if ( pet_t* pet = demon_pet( d ) )
+  {
+    pet->summon();
+    active_demon = d;
+  }
+  invalidate_cache( CACHE_PLAYER_DAMAGE_MULTIPLIER );
+  invalidate_cache( CACHE_SPELL_POWER );
+}
+
+void warlock_t::sacrifice_active_demon()
+{
+  demon_e d = active_demon;
+  if ( pet_t* cur = demon_pet( d ) )
+    cur->dismiss();
+  active_demon = DEMON_NONE;
+
+  buff.burning_shadow->expire();
+  buff.touch_of_fire->expire();
+  if ( d == DEMON_IMP )
+    buff.burning_shadow->trigger();
+  else if ( d == DEMON_SUCCUBUS )
+    buff.touch_of_fire->trigger();
+  sacrificed = d;
+  invalidate_cache( CACHE_PLAYER_DAMAGE_MULTIPLIER );
+  invalidate_cache( CACHE_SPELL_POWER );
+}
+
+void warlock_t::create_options()
+{
+  player_t::create_options();
+  add_option( opt_string( "default_pet", default_pet_str ) );
+  add_option( opt_string( "demonic_sacrifice", demonic_sacrifice_str ) );
+}
+
+void warlock_t::reset()
+{
+  player_t::reset();
+  active_demon = DEMON_NONE;
+  sacrificed   = DEMON_NONE;
+}
+
+// Warlockens egne multiplikatorer fra daemonerne: Demonic Sacrifice (effekt 1 paa sin skole), og mens en
+// daemon er ude Soul Link (+3 %) og Master Demonologist (Imp: Fire, Succubus: Shadow; effekt 1 hhv. 3).
+double warlock_t::composite_player_multiplier( school_e school ) const
+{
+  double m = player_t::composite_player_multiplier( school );
+  for ( const buff_t* b : { buff.burning_shadow, buff.touch_of_fire } )
+    if ( b && b->check() && b->data().effectN( 1 ).has_common_school( school ) )
+      m *= 1.0 + b->data().effectN( 1 ).percent();
+  if ( active_demon != DEMON_NONE )
+  {
+    if ( talent.soul_link.ok() && soul_link_effect )
+      m *= 1.0 + soul_link_effect->effectN( 1 ).percent();
+    if ( talent.master_demonologist.ok() )
+    {
+      if ( active_demon == DEMON_IMP && school == SCHOOL_FIRE )
+        m *= 1.0 + talent.master_demonologist->effectN( 1 ).percent();
+      if ( active_demon == DEMON_SUCCUBUS && school == SCHOOL_SHADOW )
+        m *= 1.0 + talent.master_demonologist->effectN( 3 ).percent();
+    }
+  }
+  return m;
+}
+
+// Demonic Knowledge (412732): + rankens andel (33/67/100 %) af warlockens level i spell damage, mens en daemon er ude.
+double warlock_t::composite_spell_power( school_e school ) const
+{
+  double sp = player_t::composite_spell_power( school );
+  if ( active_demon != DEMON_NONE && talent.demonic_knowledge.ok() )
+    sp += level() * talent.demonic_knowledge->effectN( 1 ).percent();
+  return sp;
 }
 
 action_t* warlock_t::create_action( util::string_view name, util::string_view options_str )
@@ -513,7 +937,17 @@ action_t* warlock_t::create_action( util::string_view name, util::string_view op
     return new corruption_t( this, options_str );
 
   if ( name == "summon_imp" )
-    return new summon_imp_t( this, options_str );
+    return new summon_demon_t( name, this, find_spell( 688 ), DEMON_IMP, options_str );
+  if ( name == "summon_voidwalker" )
+    return new summon_demon_t( name, this, find_spell( 697 ), DEMON_VOIDWALKER, options_str );
+  if ( name == "summon_succubus" )
+    return new summon_demon_t( name, this, find_spell( 712 ), DEMON_SUCCUBUS, options_str );
+  if ( name == "summon_felhunter" )
+    return new summon_demon_t( name, this, find_spell( 691 ), DEMON_FELHUNTER, options_str );
+  if ( name == "summon_demon" )
+    return new summon_demon_t( name, this, find_spell( 688 ), DEMON_NONE, options_str );
+  if ( name == "demonic_sacrifice" )
+    return new demonic_sacrifice_t( this, options_str );
 
   if ( name == "shoot" )
     return new shoot_t( this, options_str );
@@ -540,6 +974,16 @@ void warlock_t::create_pets()
   player_t::create_pets();
 
   pets.imp = new pets::imp::imp_pet_t( sim, this );
+  // AULA-RETTELSE: andele af creature-dps og spredning fra wowsims/forever pets.go. Voidwalkerens naerkamp er
+  // halveret (damage_mod 0,5). Felhunterens naerkamp er hos wowsims en level 60-konstant (70-97, x 0,8); her
+  // SKOENNET som samme andel af creature-dps (83,5 / 2 s / 60,45 = 0,691, +/- 16,2 %) paa alle level.
+  auto vw = new pets::melee_demon_t( sim, this, "voidwalker", PET_VOIDWALKER, DEMON_VOIDWALKER, 0.494, 0.264 );
+  vw->damage_mod = 0.5;
+  pets.voidwalker = vw;
+  pets.succubus = new pets::melee_demon_t( sim, this, "succubus", PET_SAYAAD, DEMON_SUCCUBUS, 0.698, 0.215 );
+  auto fh = new pets::melee_demon_t( sim, this, "felhunter", PET_FELHUNTER, DEMON_FELHUNTER, 0.691, 0.162 );
+  fh->damage_mod = 0.8;
+  pets.felhunter = fh;
 }
 
 void warlock_t::init_base_stats()
@@ -605,6 +1049,16 @@ void warlock_t::init_spells()
   talent.incinerate           = find_talent_spell( talent_tree::CLASS, "Incinerate" );
   talent.wrack                = find_talent_spell( talent_tree::CLASS, "Wrack" );
   talent.improved_shadow_bolt = find_talent_spell( talent_tree::CLASS, "Improved Shadow Bolt" );
+  talent.demonic_sacrifice    = find_talent_spell( talent_tree::CLASS, "Demonic Sacrifice" );
+  talent.demonic_pact         = find_talent_spell( talent_tree::CLASS, "Demonic Pact" );
+  talent.soul_link            = find_talent_spell( talent_tree::CLASS, "Soul Link" );
+  talent.master_demonologist  = find_talent_spell( talent_tree::CLASS, "Master Demonologist" );
+  talent.demonic_knowledge    = find_talent_spell( talent_tree::CLASS, "Demonic Knowledge" );
+  talent.unholy_power         = find_talent_spell( talent_tree::CLASS, "Unholy Power" );
+  talent.improved_imp         = find_talent_spell( talent_tree::CLASS, "Improved Imp" );
+  talent.improved_sayaad      = find_talent_spell( talent_tree::CLASS, "Improved Sayaad" );
+  talent.demonic_energies     = find_talent_spell( talent_tree::CLASS, "Demonic Energies" );
+  soul_link_effect            = find_spell( 25228 );
 
   rank.life_tap = { this,
     spell_container_t().set_spell(  1454 ),  // 6
@@ -659,8 +1113,19 @@ void warlock_t::init_spells()
     spell_container_t().set_spell( 1316697 ),  // 40
   };
 
+  rank.lash_of_pain = { this,
+    spell_container_t().set_spell(  7814 ),  // 20
+    spell_container_t().set_spell(  7815 ),  // 28
+    spell_container_t().set_spell(  7816 ),  // 36
+    spell_container_t().set_spell( 11778 ),  // 44
+    spell_container_t().set_spell( 11779 ),  // 52
+    spell_container_t().set_spell( 11780 ),  // 60
+  };
+
   parse_all_class_passives();
   parse_all_passive_talents();
+
+  choose_demons();
 }
 
 void warlock_t::create_buffs()
@@ -669,6 +1134,10 @@ void warlock_t::create_buffs()
 
   buff.shadow_vulnerability = make_buff_fallback( talent.improved_shadow_bolt.ok(), this, "shadow_vulnerability",
                                                   find_spell( 17794 ) );
+  buff.burning_shadow = make_buff( this, "burning_shadow", find_spell( 18789 ) )
+                          ->add_invalidate( CACHE_PLAYER_DAMAGE_MULTIPLIER );
+  buff.touch_of_fire  = make_buff( this, "touch_of_fire", find_spell( 18791 ) )
+                          ->add_invalidate( CACHE_PLAYER_DAMAGE_MULTIPLIER );
 }
 
 void warlock_t::init_gains()
@@ -676,6 +1145,7 @@ void warlock_t::init_gains()
   player_t::init_gains();
 
   gains.life_tap = get_gain( "life_tap" );
+  gains.life_tap_demon = get_gain( "life_tap_demonic_energies" );
 }
 
 void warlock_t::init_action_list()
