@@ -11,4 +11,5 @@ std::string flask( const player_t* );
 std::string food( const player_t* );
 std::string rune( const player_t* );
 std::string temporary_enchant( const player_t* );
+void mage( player_t* );
 }  // namespace mage_apl
