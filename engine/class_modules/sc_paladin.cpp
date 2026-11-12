@@ -11,6 +11,8 @@
 // Talenternes passive effekter laeses fra spildata (parse_all_passive_talents);
 // Vengeance, Sanctified Judgement og Two-Handed Weapon Specialization er
 // haandskrevet. Unsealed Wrath, Seal of the Crusader og Exorcism er ikke med.
+// Holy: Holy Shock (skade) og Divine Favor. Protection: Righteous Fury, Holy Shield
+// (skade via Shieldsworn), Swift Judgement og Consecration ogsaa paa eet maal.
 // Tal kommer fra spildata og vaabendata; undtagelser (Seal of Commands 7 PPM,
 // formlen for AP og Seal of Righteousness pr. slag) er beskrevet i PATCHES.md.
 // Fjernes naar upstream selv implementerer klassen.
@@ -60,6 +62,9 @@ struct paladin_t final : public parse_player_effects_t
     buff_t* seal_of_command       = nullptr;
     buff_t* seal_of_righteousness = nullptr;
     buff_t* vengeance             = nullptr;
+    buff_t* divine_favor          = nullptr;
+    buff_t* holy_shield           = nullptr;
+    buff_t* righteous_fury        = nullptr;
   } buff;
 
   struct
@@ -69,6 +74,11 @@ struct paladin_t final : public parse_player_effects_t
     player_talent_t sanctified_judgement;
     player_talent_t two_handed_weapon_specialization;
     player_talent_t improved_seals;
+    player_talent_t holy_shock;
+    player_talent_t divine_favor;
+    player_talent_t holy_shield;
+    player_talent_t shieldsworn;
+    player_talent_t swift_judgement;
   } talent;
 
   struct
@@ -79,6 +89,9 @@ struct paladin_t final : public parse_player_effects_t
     spell_ranks_t judgement;
     spell_ranks_t seal_of_command;
     spell_ranks_t seal_of_righteousness;
+    spell_ranks_t holy_shock;
+    spell_ranks_t holy_shield;
+    spell_ranks_t righteous_fury;
   } rank;
 
   struct
@@ -95,6 +108,7 @@ struct paladin_t final : public parse_player_effects_t
     action_t* judgement_of_righteousness  = nullptr;
     action_t* seal_of_command_cast        = nullptr;
     action_t* seal_of_righteousness_cast  = nullptr;
+    action_t* holy_shield_damage          = nullptr;
   } active;
 
   cooldown_t* seal_of_command_icd = nullptr;
@@ -361,8 +375,14 @@ struct auto_attack_t : public paladin_attack_t
 // Skaden er den aktive seals judgement-spell.
 struct judgement_t : public paladin_spell_t
 {
+  bool sanctified = true;
+
   judgement_t( paladin_t* player, std::string_view options_str ) :
-    paladin_spell_t( "judgement", player, player->rank.judgement.find_rank()->spell() )
+    judgement_t( "judgement", player, player->rank.judgement.find_rank()->spell(), options_str )
+  {}
+
+  judgement_t( std::string_view n, paladin_t* player, const spell_data_t* s, std::string_view options_str ) :
+    paladin_spell_t( n, player, s )
   {
     parse_options( options_str );
     may_miss = may_crit = false;
@@ -397,7 +417,7 @@ struct judgement_t : public paladin_spell_t
       j->execute_on_target( target );
 
     // Sanctified Judgement: $m1 % chance for at faa $m2 % af den doemte seals manapris igen.
-    if ( p()->talent.sanctified_judgement.ok() && seal &&
+    if ( sanctified && p()->talent.sanctified_judgement.ok() && seal &&
          rng().roll( p()->talent.sanctified_judgement->effectN( 1 ).percent() ) )
     {
       p()->resource_gain( RESOURCE_MANA, p()->talent.sanctified_judgement->effectN( 2 ).percent() * seal->cost(),
@@ -416,6 +436,128 @@ struct holy_strike_t : public paladin_attack_t
     parse_options( options_str );
     spell_power_mod.direct = data().effectN( 1 ).sp_coeff();
   }
+
+  void impact( action_state_t* s ) override
+  {
+    paladin_attack_t::impact( s );
+    if ( result_is_hit( s->result ) && p()->talent.shieldsworn.ok() && p()->buff.holy_shield->check() &&
+         p()->active.holy_shield_damage )
+      p()->active.holy_shield_damage->execute_on_target( s->target );
+  }
+};
+
+// Swift Judgement (Protection-talent 1310994): «Unleash the energy of a Seal spell upon an enemy. Does not consume
+// the Seal ... Does not share a cooldown with your Judgement ability». 60 s nedkoeling, ingen pris (spildata);
+// skaden er den aktive seals judgement som ved Judgement. Spillets effekt er et server-script; antagelse:
+// samme skade som Judgement, og Sanctified Judgement gaelder kun Judgement.
+struct swift_judgement_t : public judgement_t
+{
+  swift_judgement_t( paladin_t* player, std::string_view options_str ) :
+    judgement_t( "swift_judgement", player,
+                 player->talent.swift_judgement.ok() ? player->talent.swift_judgement.spell() : spell_data_t::not_found(),
+                 options_str )
+  {
+    sanctified = false;
+  }
+};
+
+// Holy Shock (Holy-talent): driveren (1311606, 20473 ...) giver pris, GCD og 10 s nedkoeling; skaden er
+// skade-spellen (1311604, 25912 ...): School Damage, Holy, SP-koefficient 0,429. Divine Favor giver 100 % crit.
+struct holy_shock_t : public paladin_spell_t
+{
+  holy_shock_t( paladin_t* player, std::string_view options_str ) :
+    paladin_spell_t( "holy_shock", player, player->rank.holy_shock.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    const spell_data_t* dmg = player->rank.holy_shock.find_rank()->attack();
+    if ( data().ok() && dmg->ok() )
+    {
+      parse_effect_data( dmg->effectN( 1 ) );
+      school = SCHOOL_HOLY;
+      may_crit = true;  // driveren er en Dummy-effekt; skade-spellen kan crit'e
+    }
+  }
+
+  double composite_crit_chance() const override
+  {
+    double c = paladin_spell_t::composite_crit_chance();
+    if ( p()->buff.divine_favor->check() )
+      c += p()->buff.divine_favor->data().effectN( 1 ).percent();
+    return c;
+  }
+
+  void execute() override
+  {
+    paladin_spell_t::execute();
+    p()->buff.divine_favor->expire();
+  }
+};
+
+// Selv-buffs: Divine Favor (Holy-talent, 120 s), Holy Shield (Protection-talent, 10 s, kraever skjold) og
+// Righteous Fury (trainer, level 10; kun trussel/forsvar, ingen skade, men koster 30 % base mana).
+struct paladin_buff_spell_t : public paladin_spell_t
+{
+  enum kind_e { DIVINE_FAVOR, HOLY_SHIELD, RIGHTEOUS_FURY } kind;
+
+  paladin_buff_spell_t( std::string_view n, paladin_t* player, const spell_data_t* s, kind_e k,
+                        std::string_view options_str ) :
+    paladin_spell_t( n, player, s ), kind( k )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    triggers_vengeance = false;
+    target = player;
+  }
+
+  buff_t* b() const
+  {
+    switch ( kind )
+    {
+      case DIVINE_FAVOR: return p()->buff.divine_favor;
+      case HOLY_SHIELD:  return p()->buff.holy_shield;
+      default:           return p()->buff.righteous_fury;
+    }
+  }
+
+  bool ready() override
+  {
+    if ( kind == HOLY_SHIELD && !p()->has_shield_equipped() )
+      return false;
+    if ( b()->check() && b()->remains() > 1_s )
+      return false;
+    return paladin_spell_t::ready();
+  }
+
+  void execute() override
+  {
+    paladin_spell_t::execute();
+    b()->trigger();
+  }
+};
+
+// Holy Shields skade (effekt 2: s2 + 0,08 x SP, Holy) pr. blokeret slag. Patchwerk-maalet slaar ikke, saa
+// skaden kommer kun via Shieldsworn (31-point-talent): Holy Strike «strikes with your shield, triggering your
+// active Holy Shield ... without consuming their charges». Holy Strikes egen skade er uaendret (antagelse).
+struct holy_shield_damage_t : public paladin_spell_t
+{
+  holy_shield_damage_t( paladin_t* player ) :
+    paladin_spell_t( "holy_shield_damage", player, player->rank.holy_shield.find_rank()->spell() )
+  {
+    background = proc = true;
+    trigger_gcd = 0_ms;
+    school = SCHOOL_HOLY;
+    base_costs[ RESOURCE_MANA ] = 0;
+    dot_duration = 0_ms;
+    cooldown->duration = 0_ms;
+    if ( data().ok() )
+    {
+      base_dd_min = base_dd_max = data().effectN( 2 ).base_value();
+      spell_power_mod.direct = data().effectN( 2 ).sp_coeff();
+    }
+  }
+
+  double cost() const override
+  { return 0; }
 };
 
 // Hammer of Wrath: kun naar maalet har 20 % liv eller mindre. Skade, cast-tid og nedkoeling fra spildata.
@@ -486,6 +628,17 @@ action_t* paladin_t::create_action( util::string_view name, util::string_view op
   if ( name == "holy_strike" )           return new holy_strike_t( this, options_str );
   if ( name == "hammer_of_wrath" )       return new hammer_of_wrath_t( this, options_str );
   if ( name == "consecration" )          return new consecration_t( this, options_str );
+  if ( name == "swift_judgement" )       return new swift_judgement_t( this, options_str );
+  if ( name == "holy_shock" )            return new holy_shock_t( this, options_str );
+  if ( name == "divine_favor" )
+    return new paladin_buff_spell_t( name, this, talent.divine_favor.ok() ? talent.divine_favor.spell() : spell_data_t::not_found(),
+                                     paladin_buff_spell_t::DIVINE_FAVOR, options_str );
+  if ( name == "holy_shield" )
+    return new paladin_buff_spell_t( name, this, rank.holy_shield.find_rank()->spell(),
+                                     paladin_buff_spell_t::HOLY_SHIELD, options_str );
+  if ( name == "righteous_fury" )
+    return new paladin_buff_spell_t( name, this, rank.righteous_fury.find_rank()->spell(),
+                                     paladin_buff_spell_t::RIGHTEOUS_FURY, options_str );
 
   return parse_player_effects_t::create_action( name, options_str );
 }
@@ -500,6 +653,8 @@ void paladin_t::create_actions()
   active.seal_of_command_cast       = new seal_of_command_t( this, "" );
   active.seal_of_righteousness_cast = new seal_of_righteousness_t( this, "" );
   active.seal_of_command_cast->background = active.seal_of_righteousness_cast->background = true;
+  if ( talent.shieldsworn.ok() && rank.holy_shield.find_rank()->spell()->ok() )
+    active.holy_shield_damage = new holy_shield_damage_t( this );
 
   seal_of_command_icd = get_cooldown( "seal_of_command_icd" );
   seal_of_command_icd->duration = rank.seal_of_command.find_rank()->spell()->internal_cooldown();
@@ -537,6 +692,17 @@ void paladin_t::create_buffs()
   buff.vengeance = make_buff_fallback( talent.vengeance.ok(), this, "vengeance", find_spell( 20050 ) )
                      ->set_default_value( talent.vengeance->effectN( 1 ).percent() )
                      ->add_invalidate( CACHE_PLAYER_DAMAGE_MULTIPLIER );
+
+  // Divine Favor: varer til naeste Holy Shock (aura uden tidsgraense i spildata).
+  buff.divine_favor = make_buff_fallback( talent.divine_favor.ok(), this, "divine_favor", talent.divine_favor )
+                        ->set_cooldown( 0_ms );
+  auto hs = rank.holy_shield.find_rank()->spell();
+  buff.holy_shield = make_buff_fallback( hs->ok(), this, "holy_shield", hs )
+                       ->set_cooldown( 0_ms )
+                       ->set_max_stack( 1 );
+  auto rf = rank.righteous_fury.find_rank()->spell();
+  buff.righteous_fury = make_buff_fallback( rf->ok(), this, "righteous_fury", rf )
+                          ->set_cooldown( 0_ms );
 }
 
 double paladin_t::composite_player_multiplier( school_e school ) const
@@ -563,6 +729,11 @@ void paladin_t::init_spells()
   talent.sanctified_judgement = find_talent_spell( talent_tree::CLASS, "Sanctified Judgement" );
   talent.improved_seals       = find_talent_spell( talent_tree::CLASS, "Improved Seals" );
   talent.two_handed_weapon_specialization = find_talent_spell( talent_tree::CLASS, "Two-Handed Weapon Specialization" );
+  talent.holy_shock      = find_talent_spell( talent_tree::CLASS, "Holy Shock" );
+  talent.divine_favor    = find_talent_spell( talent_tree::CLASS, "Divine Favor" );
+  talent.holy_shield     = find_talent_spell( talent_tree::CLASS, "Holy Shield" );
+  talent.shieldsworn     = find_talent_spell( talent_tree::CLASS, "Shieldsworn" );
+  talent.swift_judgement = find_talent_spell( talent_tree::CLASS, "Swift Judgement" );
 
   // kommentar = spell level
   rank.judgement = { this,
@@ -605,6 +776,26 @@ void paladin_t::init_spells()
     spell_container_t().set_spell( 24275 ),  // 44
     spell_container_t().set_spell( 24274 ),  // 52
     spell_container_t().set_spell( 24239 ),  // 60
+  };
+
+  // Holy Shock (talent): spell = driver (pris, nedkoeling), attack = skade-spellen
+  rank.holy_shock = { this, talent.holy_shock,
+    spell_container_t().set_spell( 1311606 ).set_attack( 1311604 ),  // 30
+    spell_container_t().set_spell(   20473 ).set_attack(   25912 ),  // 40
+    spell_container_t().set_spell(   20929 ).set_attack(   25911 ),  // 48
+    spell_container_t().set_spell(   20930 ).set_attack(   25902 ),  // 56
+  };
+
+  // Holy Shield (talent)
+  rank.holy_shield = { this, talent.holy_shield,
+    spell_container_t().set_spell(   20925 ),  // 30
+    spell_container_t().set_spell(   20927 ),  // 40
+    spell_container_t().set_spell(   20928 ),  // 50
+    spell_container_t().set_spell( 1239570 ),  // 60
+  };
+
+  rank.righteous_fury = { this,
+    spell_container_t().set_spell( 25780 ),  // 10
   };
 
   // spell = Consecration, attack = tick-skaden
