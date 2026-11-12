@@ -3,6 +3,8 @@
 // Contact: https://github.com/orgs/simulationcraft/teams/priest/members
 // Wiki: https://github.com/simulationcraft/simc/wiki/Priests
 // ==========================================================================
+// AULA-RETTELSE (simc-worker/patches/priest.patch i AULA-Guild): wand (Shoot) og en
+// mana-bevidst rotation (wand-fase ved lav mana, Holy Fire uden Mind Flay). Se PATCHES.md.
 
 #include "simulationcraft.hpp"
 #include "action/parse_effects.hpp"
@@ -364,8 +366,7 @@ void priest_t::init_spells()
   talent.shadowform          = find_talent_spell( talent_tree::CLASS, "Shadowform" );
   talent.vampiric_embrace    = find_talent_spell( talent_tree::CLASS, "Vampiric Embrace" );
 
-  // Wand only, all schools because wand damage can be any school
-  // TODO: Apply to the wand auto attack once implemented
+  // Wand only, all schools because wand damage can be any school; applied in shoot_t
   talent.wand_specialization = find_talent_spell( talent_tree::CLASS, "Wand Specialization" );
   deregister_passive_spell( talent.wand_specialization );
 
@@ -653,6 +654,55 @@ struct holy_fire_t : public priest_spell_t
   }
 };
 
+// Shoot (wand, 5019): et skud med den udstyrede wand i ranged-pladsen (samme model som
+// mage.patch). Spildataen siger Weapon Damage (NoSchool) og Spell Type Magic: skaden er wandens
+// vaabenskade, skolen kommer fra wanden, og skuddet bruger spell-tabellen (hit/crit). Hvert skud
+// er en "cast" af wandens hastighed, saa APL'en kan vende tilbage til spells naar manaen er der.
+// Uden wand i ranged-pladsen er handlingen aldrig klar.
+struct shoot_t : public priest_spell_t
+{
+  shoot_t( priest_t* player, util::string_view options_str ) :
+    priest_spell_t( "shoot", player, player->find_spell( 5019 ) )
+  {
+    parse_options( options_str );
+
+    weapon            = &player->equipped_weapons[ SLOT_RANGED ];
+    weapon_multiplier = 1.0;
+    base_execute_time = weapon->swing_time;
+    may_crit          = true;
+    // Wandens egen skole, hvis profilen angiver den (weapon=wand_..._shadow); ellers spildataens.
+    if ( weapon->school != SCHOOL_PHYSICAL && weapon->school != SCHOOL_NONE )
+      school = weapon->school;
+  }
+
+  bool has_wand() const
+  { return weapon && weapon->type == WEAPON_WAND && weapon->max_dmg > 0; }
+
+  // Wand-skade er magisk (Spell Type Magic); rustning gaelder ikke, selv om skolen er ukendt.
+  double composite_target_armor( const action_state_t* ) const override
+  { return 0.0; }
+
+  // Wandens hastighed, ikke spell-haste.
+  timespan_t execute_time() const override
+  { return base_execute_time; }
+
+  // Wand Specialization: +% wand-skade (rank-vaerdien fra spildataen).
+  double composite_da_multiplier( const action_state_t* s ) const override
+  {
+    double m = priest_spell_t::composite_da_multiplier( s );
+    if ( p()->talent.wand_specialization.ok() )
+      m *= 1.0 + p()->talent.wand_specialization->effectN( 1 ).percent();
+    return m;
+  }
+
+  bool ready() override
+  {
+    if ( !has_wand() )
+      return false;
+    return priest_spell_t::ready();
+  }
+};
+
 // Penance TODO: Check Penance vs Inner Focus - Right now only first bolt gets the crit bonus
 // driver: channel, attack: damage bolt
 struct penance_damage_t : public priest_spell_t
@@ -911,6 +961,8 @@ action_t* priest_t::create_action( util::string_view name, util::string_view opt
     return new inner_focus_t( this, options_str );
   if ( name == "shadowform" )
     return new shadowform_t( this, options_str );
+  if ( name == "shoot" )
+    return new shoot_t( this, options_str );
 
   return parse_player_effects_t::create_action( name, options_str );
 }

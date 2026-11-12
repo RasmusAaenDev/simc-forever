@@ -39,14 +39,22 @@ void priest( player_t* p )
   precombat->add_action( "shadowform" );
 
   default_->add_action( "dark_sacrifice,if=mana.pct<50" );
+  // AULA-RETTELSE: mana-styring. Under 10 % mana skydes der med wand, til manaen er over 40 % igen;
+  // uden spells bliver femsekundsreglen ikke ved med at blokere spirit-regen. Taersklerne er antagelser.
+  default_->add_action( "variable,name=wand_phase,op=set,value=1,if=mana.pct<10" );
+  default_->add_action( "variable,name=wand_phase,op=set,value=0,if=mana.pct>40" );
+  default_->add_action( "shoot,if=variable.wand_phase" );
   default_->add_action( "shadow_word_pain,if=!ticking" );
   default_->add_action( "devouring_plague,if=!ticking" );
   default_->add_action( "mind_blast" );
   default_->add_action( "shadow_word_death" );
   default_->add_action( "penance" );
   default_->add_action( "starshards" );
+  // Discipline/Holy (uden Mind Flay): Holy Fire er implementeret, men stod ikke i rotationen.
+  default_->add_action( "holy_fire,if=!ticking&!talent.mind_flay.enabled" );
   default_->add_action( "mind_flay" );
   default_->add_action( "smite" );
+  default_->add_action( "shoot" );
 }
 //priest_apl_end
 }  // namespace priest_apl
