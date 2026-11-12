@@ -7,13 +7,16 @@
 // Grov basismodel for Forever-mage, bygget efter warlock-modulets skabelon.
 // Spells med rank efter spillerens level. Talenternes passive effekter laeses
 // fra spildata (parse_all_passive_talents). Frost-pakken: Ice Lance, frossen
-// tilstand (Frostbite), Fingers of Frost, Shatter og Ice Barrier. Wand (Shoot)
-// og Evocation til mana-styring.
+// tilstand (Frostbite), Fingers of Frost, Shatter og Ice Barrier. Fire-pakken:
+// Scorch, Pyroblast, Ignite, Improved Scorch (Fire Vulnerability), Heating Up,
+// Combustion, Master of Elements og Fire Power. Wand (Shoot) og Evocation til
+// mana-styring. APL'en vaelger rotation ud fra de valgte talenter.
 // Alle tal kommer fra spildata og vaabendata.
 // Fjernes naar upstream selv implementerer klassen.
 
 #include "simulationcraft.hpp"
 #include "action/parse_effects.hpp"
+#include "action/residual_action.hpp"
 
 #include "class_modules/apl/mage.hpp"
 
@@ -21,12 +24,14 @@ namespace mage
 {
 struct mage_t;
 
-// Maalets tilstand: "frozen" = Frostbite (12494, Root, 5 s) fra Frostbolts Chill.
+// Maalets tilstand: "frozen" = Frostbite (12494, Root, 5 s) fra Frostbolts Chill;
+// "fire_vulnerability" = Improved Scorch (22959, +3 % Fire-skade fra magen pr. stak, 5 stak, 30 s).
 struct mage_td_t final : public actor_target_data_t
 {
   struct
   {
     buff_t* frozen;
+    buff_t* fire_vulnerability;
   } debuff;
 
   mage_td_t( player_t* target, mage_t& p );
@@ -49,6 +54,8 @@ struct mage_t final : public parse_player_effects_t
   void init_spells() override;
   void create_buffs() override;
   void init_finished() override;
+  void create_actions() override;
+  void init_gains() override;
 
   target_specific_t<mage_td_t> target_data;
 
@@ -63,12 +70,31 @@ struct mage_t final : public parse_player_effects_t
   // Frostbolts Chill ramte: Frostbite (frys) og Fingers of Frost kan udloeses.
   void trigger_chill( action_state_t* s );
 
+  // Direkte skadeshit fra en af magens spells: Ignite, Combustion, Heating Up, Master of Elements.
+  void trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source );
+
+  // Fire Power: antal af magens Fire-effekter paa maalet (hoejst 4).
+  int fire_effects_on( player_t* t ) const;
+
+  struct
+  {
+    action_t* ignite;
+  } action;
+
+  struct
+  {
+    gain_t* master_of_elements;
+  } gains;
+
   struct
   {
     buff_t* evocation;
     buff_t* fingers_of_frost;
     buff_t* ice_barrier;
     buff_t* frigid_power;
+    buff_t* heating_up;
+    buff_t* combustion;       // 11129: tilbagevaerende crits (3)
+    buff_t* combustion_crit;  // 28682: +10 % crit pr. stak paa Fire-spells
   } buff;
 
   struct
@@ -79,6 +105,13 @@ struct mage_t final : public parse_player_effects_t
     player_talent_t shatter;
     player_talent_t ice_lance;
     player_talent_t ice_barrier;
+    player_talent_t pyroblast;
+    player_talent_t ignite;
+    player_talent_t improved_scorch;
+    player_talent_t heating_up;
+    player_talent_t master_of_elements;
+    player_talent_t fire_power;
+    player_talent_t combustion;
   } talent;
 
   struct
@@ -90,12 +123,17 @@ struct mage_t final : public parse_player_effects_t
     spell_ranks_t frostbolt;
     spell_ranks_t ice_lance;
     spell_ranks_t ice_barrier;
+    spell_ranks_t scorch;
+    spell_ranks_t pyroblast;
+    spell_ranks_t combustion;
   } rank;
 };
 
 inline mage_td_t::mage_td_t( player_t* target, mage_t& p ) : actor_target_data_t( target, &p )
 {
   debuff.frozen = make_buff_fallback( p.talent.frostbite.ok() && target->is_enemy(), *this, "frozen", p.find_spell( 12494 ) );
+  debuff.fire_vulnerability = make_buff_fallback( p.talent.improved_scorch.ok() && target->is_enemy(), *this,
+                                                  "fire_vulnerability", p.find_spell( 22959 ) );
 }
 
 // MAGE MODULE INTERFACE ====================================================
@@ -138,6 +176,10 @@ public:
     {
       this->parse_effects( p()->buff.ice_barrier );
       this->parse_effects( p()->buff.frigid_power );
+      // Heating Up (400625): -25 % cast-tid pr. stak paa Pyroblast. Combustion (28682):
+      // +10 % crit pr. stak paa Fire-spells. Begge virker kun paa spildataens beroerte spells.
+      this->parse_effects( p()->buff.heating_up );
+      this->parse_effects( p()->buff.combustion_crit );
     }
   }
 
@@ -152,6 +194,8 @@ public:
   // Shoot (wand, auto-repeat) og spells paa magen selv er ikke omfattet.
   bool affected_by_frozen = true;
   bool frozen_cast = false;
+  // Heating Up taeller ikke-periodiske crits fra Fireball, Fire Blast og Scorch.
+  bool heating_up_source = false;
 
   bool target_frozen( player_t* t ) const
   { return p()->buff.fingers_of_frost->check() || p()->get_target_data( t )->debuff.frozen->check(); }
@@ -166,6 +210,36 @@ public:
     // Fingers of Frost: "your next N spells" -> en ladning pr. kastet spell.
     if ( fof )
       p()->buff.fingers_of_frost->decrement();
+  }
+
+  // Direkte hit (ikke DoT-ticks): Ignite, Combustion, Heating Up og Master of Elements.
+  void impact( action_state_t* s ) override
+  {
+    ab::impact( s );
+    if ( this->harmful && s->result_type == result_amount_type::DMG_DIRECT && this->result_is_hit( s->result ) )
+      p()->trigger_direct_procs( this, s, heating_up_source );
+  }
+
+  // Improved Scorch (Fire Vulnerability, +3 % pr. stak) og Fire Power (+1-3 % pr. Fire-effekt
+  // paa maalet, hoejst 4) gaelder al magens Fire-skade, direkte og periodisk.
+  double composite_target_multiplier( player_t* t ) const override
+  {
+    double m = ab::composite_target_multiplier( t );
+    if ( this->get_school() != SCHOOL_FIRE || !this->harmful )
+      return m;
+    if ( p()->talent.improved_scorch.ok() )
+    {
+      const buff_t* fv = p()->get_target_data( t )->debuff.fire_vulnerability;
+      if ( fv->check() )
+        m *= 1.0 + fv->check() * fv->data().effectN( 1 ).percent();
+    }
+    if ( p()->talent.fire_power.ok() )
+    {
+      int n = p()->fire_effects_on( t );
+      if ( n )
+        m *= 1.0 + n * p()->talent.fire_power->effectN( 1 ).percent();
+    }
+    return m;
   }
 
   // Shatter (11170): +17/33/50 % crit (talentkurven) for alle spells mod frosne maal.
@@ -249,6 +323,7 @@ struct fireball_t : public mage_spell_t
     mage_spell_t( "fireball", player, player->rank.fireball.find_rank()->spell() )
   {
     parse_options( options_str );
+    heating_up_source = true;
   }
 };
 
@@ -259,6 +334,101 @@ struct fire_blast_t : public mage_spell_t
     mage_spell_t( "fire_blast", player, player->rank.fire_blast.find_rank()->spell() )
   {
     parse_options( options_str );
+    heating_up_source = true;
+  }
+
+  // Heating Up: "Fire Blast grants an additional stack every time it deals damage" (ud over crit-stakken).
+  void impact( action_state_t* s ) override
+  {
+    mage_spell_t::impact( s );
+    if ( p()->talent.heating_up.ok() && result_is_hit( s->result ) )
+      p()->buff.heating_up->trigger();
+  }
+};
+
+// Scorch (traeneren, level 22+): 1,5 s cast. Improved Scorch (11095): 33/67/100 % chance pr. hit
+// for en stak Fire Vulnerability (22959) paa maalet.
+struct scorch_t : public mage_spell_t
+{
+  scorch_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "scorch", player, player->rank.scorch.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    heating_up_source = true;
+  }
+
+  void impact( action_state_t* s ) override
+  {
+    mage_spell_t::impact( s );
+    if ( p()->talent.improved_scorch.ok() && result_is_hit( s->result ) &&
+         rng().roll( p()->talent.improved_scorch->effectN( 1 ).percent() ) )
+      p()->get_target_data( s->target )->debuff.fire_vulnerability->trigger();
+  }
+};
+
+// Pyroblast (talent 11366; hoejere ranks kraever talentet): 6 s cast, direkte skade + DoT
+// (4 ticks a 3 s), alt fra spildata. Heating Up-stakkene (-25 % cast-tid hver) bruges op.
+struct pyroblast_t : public mage_spell_t
+{
+  pyroblast_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "pyroblast", player, player->rank.pyroblast.find_rank()->spell() )
+  {
+    parse_options( options_str );
+  }
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.heating_up->expire();
+  }
+};
+
+// Combustion (talent 11129): hvert Fire-hit giver +10 % crit (28682, stakker), indtil magen har
+// lavet 3 ikke-periodiske Fire-crits. Ingen GCD; 180 s nedkoeling, der ifoelge spildata
+// ("Cooldown On Event") foerst starter, naar effekten er brugt op (se trigger_direct_procs).
+struct combustion_t : public mage_spell_t
+{
+  combustion_t( mage_t* player, std::string_view options_str ) :
+    mage_spell_t( "combustion", player, player->rank.combustion.find_rank()->spell() )
+  {
+    parse_options( options_str );
+    harmful = may_miss = may_crit = false;
+    target = player;
+  }
+
+  bool ready() override
+  {
+    if ( p()->buff.combustion->check() )
+      return false;
+    return mage_spell_t::ready();
+  }
+
+  void update_ready( timespan_t ) override {}
+
+  void execute() override
+  {
+    mage_spell_t::execute();
+    p()->buff.combustion->trigger( p()->buff.combustion->max_stack() );
+  }
+};
+
+// Ignite (talent 11119): Fire-crits braender maalet for 8-40 % af crittets skade over 4 s
+// (412538, tick hver 2 s). Rullende: ny Ignite laegges oven i resten af den gamle. Skaden er
+// en fast andel af crittet, saa ingen multiplikatorer laegges paa igen (antagelse).
+struct ignite_t : public residual_action::residual_periodic_action_t<spell_t>
+{
+  ignite_t( mage_t* player ) : base_t( "ignite", player, player->find_spell( 412538 ) )
+  {
+    dot_duration   = data().duration();
+    base_tick_time = data().effectN( 1 ).period();
+    hasted_ticks = tick_may_crit = may_miss = false;
+    school = SCHOOL_FIRE;
+  }
+
+  void init() override
+  {
+    base_t::init();
+    snapshot_flags = update_flags = 0;
   }
 };
 
@@ -382,6 +552,12 @@ action_t* mage_t::create_action( std::string_view name, std::string_view options
     return new ice_lance_t( this, options_str );
   if ( name == "ice_barrier" )
     return new ice_barrier_t( this, options_str );
+  if ( name == "scorch" )
+    return new scorch_t( this, options_str );
+  if ( name == "pyroblast" )
+    return new pyroblast_t( this, options_str );
+  if ( name == "combustion" )
+    return new combustion_t( this, options_str );
 
   return parse_player_effects_t::create_action( name, options_str );
 }
@@ -410,6 +586,62 @@ void mage_t::create_buffs()
   buff.ice_barrier = make_buff_fallback( ice_barrier->ok(), this, "ice_barrier", ice_barrier )
                        ->set_cooldown( 0_ms );
   buff.frigid_power = make_buff_fallback( ice_barrier->ok(), this, "frigid_power", find_spell( 1326891 ) );
+
+  // Heating Up (400625): 20 s, op til 3 stak, -25 % cast-tid paa Pyroblast pr. stak.
+  buff.heating_up = make_buff_fallback( talent.heating_up.ok(), this, "heating_up", find_spell( 400625 ) );
+
+  // Combustion: taelleren (11129, 3 crits) og crit-stakken (28682, +10 % pr. stak, op til 10).
+  auto const combustion = rank.combustion.find_rank()->spell();
+  buff.combustion = make_buff_fallback( combustion->ok(), this, "combustion", combustion )->set_cooldown( 0_ms );
+  buff.combustion_crit = make_buff_fallback( combustion->ok(), this, "combustion_crit", find_spell( 28682 ) );
+}
+
+int mage_t::fire_effects_on( player_t* t ) const
+{
+  int n = get_target_data( t )->debuff.fire_vulnerability->check() ? 1 : 0;
+  for ( auto name : { "fireball", "pyroblast", "ignite" } )
+  {
+    dot_t* d = t->find_dot( name, const_cast<mage_t*>( this ) );
+    if ( d && d->is_ticking() )
+      n++;
+  }
+  return std::min( n, 4 );
+}
+
+void mage_t::trigger_direct_procs( action_t* a, action_state_t* s, bool heating_up_source )
+{
+  school_e school = a->get_school();
+  bool crit = s->result == RESULT_CRIT;
+
+  if ( school == SCHOOL_FIRE )
+  {
+    // Ignite: 8-40 % af crittets skade som rullende DoT.
+    if ( crit && talent.ignite.ok() )
+      residual_action::trigger( action.ignite, s->target, s->result_amount * talent.ignite->effectN( 1 ).percent() );
+
+    // Heating Up: ikke-periodiske crits med Fireball, Fire Blast og Scorch.
+    if ( crit && heating_up_source && talent.heating_up.ok() )
+      buff.heating_up->trigger();
+
+    // Combustion: et crit bruger en af de 3; hvert hit, mens Combustion er aktiv, giver en crit-stak.
+    if ( buff.combustion->check() )
+    {
+      if ( crit )
+        buff.combustion->decrement();
+      if ( buff.combustion->check() )
+        buff.combustion_crit->trigger();
+      else
+      {
+        buff.combustion_crit->expire();
+        get_cooldown( "combustion" )->start( rank.combustion.find_rank()->spell()->cooldown() );
+      }
+    }
+  }
+
+  // Master of Elements: Fire- og Frost-crits giver 10/20/30 % af spellens basis-mana tilbage.
+  if ( crit && talent.master_of_elements.ok() && ( school == SCHOOL_FIRE || school == SCHOOL_FROST ) )
+    resource_gain( RESOURCE_MANA, a->base_costs[ RESOURCE_MANA ].base * talent.master_of_elements->effectN( 1 ).percent(),
+                   gains.master_of_elements, a );
 }
 
 void mage_t::trigger_chill( action_state_t* s )
@@ -421,6 +653,18 @@ void mage_t::trigger_chill( action_state_t* s )
   // Fingers of Frost (400647): effekt 2 = 15 % chance; buffen faar fulde ladninger.
   if ( talent.fingers_of_frost.ok() && rng().roll( talent.fingers_of_frost->effectN( 2 ).percent() ) )
     buff.fingers_of_frost->trigger( buff.fingers_of_frost->max_stack() );
+}
+
+void mage_t::create_actions()
+{
+  action.ignite = talent.ignite.ok() ? new ignite_t( this ) : nullptr;
+  parse_player_effects_t::create_actions();
+}
+
+void mage_t::init_gains()
+{
+  parse_player_effects_t::init_gains();
+  gains.master_of_elements = talent.master_of_elements.ok() ? get_gain( "master_of_elements" ) : nullptr;
 }
 
 void mage_t::init_finished()
@@ -440,6 +684,39 @@ void mage_t::init_spells()
   talent.shatter          = find_talent_spell( talent_tree::CLASS, "Shatter" );
   talent.ice_lance        = find_talent_spell( talent_tree::CLASS, "Ice Lance" );
   talent.ice_barrier      = find_talent_spell( talent_tree::CLASS, "Ice Barrier" );
+
+  talent.pyroblast          = find_talent_spell( talent_tree::CLASS, "Pyroblast" );
+  talent.ignite             = find_talent_spell( talent_tree::CLASS, "Ignite" );
+  talent.improved_scorch    = find_talent_spell( talent_tree::CLASS, "Improved Scorch" );
+  talent.heating_up         = find_talent_spell( talent_tree::CLASS, "Heating Up" );
+  talent.master_of_elements = find_talent_spell( talent_tree::CLASS, "Master of Elements" );
+  talent.fire_power         = find_talent_spell( talent_tree::CLASS, "Fire Power" );
+  talent.combustion         = find_talent_spell( talent_tree::CLASS, "Combustion" );
+
+  rank.pyroblast = { this, talent.pyroblast,
+    spell_container_t().set_spell( 11366 ),  // 20
+    spell_container_t().set_spell( 12505 ),  // 24
+    spell_container_t().set_spell( 12522 ),  // 30
+    spell_container_t().set_spell( 12523 ),  // 36
+    spell_container_t().set_spell( 12524 ),  // 42
+    spell_container_t().set_spell( 12525 ),  // 48
+    spell_container_t().set_spell( 12526 ),  // 54
+    spell_container_t().set_spell( 18809 ),  // 60
+  };
+
+  rank.combustion = { this, talent.combustion,
+    spell_container_t().set_spell( 11129 ),  // 40
+  };
+
+  rank.scorch = { this,
+    spell_container_t().set_spell(  2948 ),  // 22
+    spell_container_t().set_spell(  8444 ),  // 28
+    spell_container_t().set_spell(  8445 ),  // 34
+    spell_container_t().set_spell(  8446 ),  // 40
+    spell_container_t().set_spell( 10205 ),  // 46
+    spell_container_t().set_spell( 10206 ),  // 52
+    spell_container_t().set_spell( 10207 ),  // 58
+  };
 
   // Talent-spells: rank 1 = talentet; hoejere ranks kraever talentet (kommentar = spell level).
   rank.ice_lance = { this, talent.ice_lance,
